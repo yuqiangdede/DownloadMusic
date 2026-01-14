@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from mutagen.id3 import APIC, ID3
+    from mutagen.id3 import ID3
+    from mutagen.id3._frames import APIC
 except Exception:
     APIC = None
     ID3 = None
@@ -722,20 +723,18 @@ def main():
                 um=um, input_path=ncm, output_dir=ncm.parent, dry_run=dry_run
             )
 
-    # Step 1: 重命名“最里面的目录”（artist - album），用 ID3 避免乱码
+    # Step 1: 重命名“最里面的目录”（album），用 ID3 避免乱码
     album_dirs = find_leaf_mp3_dirs(res_root)
     for d in album_dirs:
-        album_counts: Dict[Tuple[str, str], int] = {}
+        album_counts: Dict[str, int] = {}
         for mp3 in d.glob("*.mp3"):
             if not mp3.is_file():
                 continue
             tags = read_id3_basic(mp3)
-            artist = (tags.get("artist") or "").strip()
             album = (tags.get("album") or "").strip()
-            if not artist or not album:
+            if not album:
                 continue
-            key = (artist, album)
-            album_counts[key] = album_counts.get(key, 0) + 1
+            album_counts[album] = album_counts.get(album, 0) + 1
 
         if not album_counts:
             continue
@@ -743,8 +742,9 @@ def main():
         if len(album_counts) > 1:
             print(f"[WARN] 目录包含多个专辑，将使用数量最多的标签重命名：{d}")
 
-        artist, album = max(album_counts, key=album_counts.get)
-        new_name = sanitize_windows_name(f"{artist} - {album}")
+        album = max(album_counts.items(), key=lambda item: item[1])[0]
+        new_name = sanitize_windows_name(album)
+
         new_path = d.parent / new_name
         try:
             safe_rename(d, new_path, dry_run, args.force_rename)
