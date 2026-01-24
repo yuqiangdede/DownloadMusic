@@ -6,7 +6,8 @@
 
 0) 用 Unlock Music CLI(um.exe) 把 res/**.ncm 转成 mp3（每目录批量）
    - 修复 Windows 下 subprocess 输出解码报错（GBK/UTF-8 混杂）
-1) 按 artist - album 重命名 res/* 一级目录（用 ID3，避免 ffprobe 标签乱码）
+   - 尝试写入 NCM 内嵌封面（补齐 MP3 封面）
+1) 按 artist - album 分类目录（用 ID3，避免 ffprobe 标签乱码）
 2) 递归重命名 mp3：{track} - {titlepart}.mp3（titlepart 取原文件名最后一个 "- " 后的部分）
 3) 每目录统一封面：选该目录下第一个含 ID3 APIC 的 mp3 作为封面源
 4) 每个 mp3 用“目录封面图片”+自己的音频生成同名 mp4
@@ -19,8 +20,10 @@ import json
 import hashlib
 import os
 import re
+import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -95,6 +98,99 @@ def decode_bytes(b: bytes) -> str:
         except Exception:
             pass
     return b.decode("utf-8", errors="replace")
+
+
+def collect_audio_files(dir_path: Path) -> set[Path]:
+    audio_exts = (".mp3", ".flac", ".wav", ".m4a")
+    return {
+        p.resolve()
+        for p in dir_path.iterdir()
+        if p.is_file() and p.suffix.lower() in audio_exts
+    }
+
+
+def extract_ncm_cover_bytes(ncm_path: Path) -> Optional[bytes]:
+    try:
+        with ncm_path.open("rb") as f:
+            if f.read(8) != b"CTENFDAM":
+                return None
+            f.seek(2, 1)
+            key_len_raw = f.read(4)
+            if len(key_len_raw) != 4:
+                return None
+            key_len = struct.unpack("<I", key_len_raw)[0]
+            f.seek(key_len, 1)
+            meta_len_raw = f.read(4)
+            if len(meta_len_raw) != 4:
+                return None
+            meta_len = struct.unpack("<I", meta_len_raw)[0]
+            f.seek(meta_len, 1)
+            f.seek(4, 1)  # crc
+            img_len_raw = f.read(4)
+            if len(img_len_raw) != 4:
+                return None
+            img_len = struct.unpack("<I", img_len_raw)[0]
+            if img_len <= 0 or img_len > 20 * 1024 * 1024:
+                return None
+            data = f.read(img_len)
+            if len(data) != img_len:
+                return None
+            return data
+    except Exception:
+        return None
+
+
+def detect_image_mime_from_bytes(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return "image/jpeg"
+
+
+def find_ncm_output_audio_file(
+    output_dir: Path, ncm_path: Path, before_files: set[Path], start_ts: float
+) -> Optional[Path]:
+    for ext in (".mp3", ".flac", ".wav", ".m4a"):
+        candidate = output_dir / f"{ncm_path.stem}{ext}"
+        if candidate.exists():
+            return candidate
+
+    after_files = collect_audio_files(output_dir)
+    new_files = sorted(
+        after_files - before_files, key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if new_files:
+        return new_files[0]
+
+    candidates = list(after_files)
+    recent = [p for p in candidates if p.stat().st_mtime >= start_ts - 1]
+    if recent:
+        return max(recent, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def try_write_ncm_cover(
+    ncm_path: Path, output_dir: Path, before_files: set[Path], start_ts: float
+) -> None:
+    cover_data = extract_ncm_cover_bytes(ncm_path)
+    if not cover_data:
+        return
+    target = find_ncm_output_audio_file(output_dir, ncm_path, before_files, start_ts)
+    if not target:
+        print(f"[WARN] NCM 转换成功但未找到输出文件，跳过写入封面：{ncm_path}")
+        return
+    if target.suffix.lower() != ".mp3":
+        return
+    if has_apic(target):
+        print(f"[COVER] 已有封面，跳过写入：{target.name}")
+        return
+    mime = detect_image_mime_from_bytes(cover_data)
+    ok = write_apic_bytes(target, cover_data, mime)
+    if ok:
+        print(f"[COVER] 写入 NCM 内嵌封面：{target.name}")
+    else:
+        print(f"[WARN] 写入封面失败：{target}")
 
 
 def mp3_audio_fingerprint_quick(p: Path, sample_bytes: int = 65536) -> str:
@@ -320,7 +416,32 @@ def has_apic(mp3_path: Path) -> bool:
         return False
     try:
         id3 = ID3(str(mp3_path))
-        return any(k.startswith("APIC") for k in id3.keys())
+        return any(k.startswith("APIC") or k.startswith("PIC") for k in id3.keys())
+    except Exception:
+        return False
+
+
+def write_apic_bytes(mp3_path: Path, cover_data: bytes, mime: str) -> bool:
+    if ID3 is None or APIC is None:
+        return False
+    try:
+        id3 = ID3(str(mp3_path))
+    except Exception:
+        id3 = ID3()
+
+    try:
+        id3.delall("APIC")
+        id3.add(
+            APIC(
+                encoding=3,
+                mime=mime,
+                type=3,
+                desc="Cover",
+                data=cover_data,
+            )
+        )
+        id3.save(str(mp3_path))
+        return True
     except Exception:
         return False
 
@@ -334,7 +455,7 @@ def extract_apic_to_jpg(mp3_path: Path, out_jpg: Path) -> bool:
         return False
     try:
         id3 = ID3(str(mp3_path))
-        apic_keys = [k for k in id3.keys() if k.startswith("APIC")]
+        apic_keys = [k for k in id3.keys() if k.startswith("APIC") or k.startswith("PIC")]
         if not apic_keys:
             return False
         apic = id3[apic_keys[0]]
@@ -475,6 +596,46 @@ def find_leaf_mp3_dirs(res_root: Path) -> List[Path]:
                 parents_with_children.add(parent)
     leaf_dirs = [d for d in mp3_dirs if d not in parents_with_children]
     return sorted(leaf_dirs, key=lambda p: str(p).lower())
+
+
+def organize_mp3_by_artist_album(
+    res_root: Path, dry_run: bool, force_rename: bool
+) -> None:
+    album_to_mp3s: Dict[str, List[Path]] = {}
+    album_to_artist_counts: Dict[str, Dict[str, int]] = {}
+
+    for mp3 in res_root.rglob("*.mp3"):
+        if not mp3.is_file():
+            continue
+        tags = read_id3_basic(mp3)
+        album = (tags.get("album") or "").strip()
+        if not album:
+            continue
+        album_to_mp3s.setdefault(album, []).append(mp3)
+        artist = (tags.get("artist") or "").strip()
+        if artist:
+            counts = album_to_artist_counts.setdefault(album, {})
+            counts[artist] = counts.get(artist, 0) + 1
+
+    for album, mp3s in album_to_mp3s.items():
+        artist_counts = album_to_artist_counts.get(album, {})
+        if len(artist_counts) > 1:
+            print(f"[WARN] 专辑包含多个歌手，将使用数量最多的歌手命名：{album}")
+        artist = max(artist_counts.items(), key=lambda item: item[1])[0] if artist_counts else ""
+        folder_name = sanitize_windows_name(f"{artist} - {album}" if artist else album)
+        target_dir = res_root / folder_name
+        if not target_dir.exists():
+            print(f"[INFO] 创建目录：{target_dir}")
+            if not dry_run:
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+        for mp3 in mp3s:
+            if mp3.parent.resolve() == target_dir.resolve():
+                continue
+            if target_dir in mp3.parents:
+                continue
+            new_path = target_dir / mp3.name
+            safe_rename(mp3, new_path, dry_run, force_rename)
 
 
 def gen_mp4_with_cover_jpg(
@@ -645,6 +806,9 @@ def convert_ncm_to_mp3(
     if dry_run:
         return True
 
+    start_ts = time.time()
+    before_files = collect_audio_files(output_dir)
+
     rc, outb, errb = run_cmd_bytes(cmd)
     if rc != 0:
         out_text = decode_bytes(outb)
@@ -659,12 +823,15 @@ def convert_ncm_to_mp3(
         if "successfully converted" in combined and any(
             m in combined for m in benign_markers
         ):
+            try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
             return True
         print(
             f"[WARN] NCM 转换失败：{input_path}\n{err_text}\n{out_text}",
             file=sys.stderr,
         )
         return False
+
+    try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
     return True
 
 
@@ -723,33 +890,8 @@ def main():
                 um=um, input_path=ncm, output_dir=ncm.parent, dry_run=dry_run
             )
 
-    # Step 1: 重命名“最里面的目录”（album），用 ID3 避免乱码
-    album_dirs = find_leaf_mp3_dirs(res_root)
-    for d in album_dirs:
-        album_counts: Dict[str, int] = {}
-        for mp3 in d.glob("*.mp3"):
-            if not mp3.is_file():
-                continue
-            tags = read_id3_basic(mp3)
-            album = (tags.get("album") or "").strip()
-            if not album:
-                continue
-            album_counts[album] = album_counts.get(album, 0) + 1
-
-        if not album_counts:
-            continue
-
-        if len(album_counts) > 1:
-            print(f"[WARN] 目录包含多个专辑，将使用数量最多的标签重命名：{d}")
-
-        album = max(album_counts.items(), key=lambda item: item[1])[0]
-        new_name = sanitize_windows_name(album)
-
-        new_path = d.parent / new_name
-        try:
-            safe_rename(d, new_path, dry_run, args.force_rename)
-        except PermissionError as e:
-            print(f"[WARN] 重命名失败（权限/占用）：{d} err={e}", file=sys.stderr)
+    # Step 1: 按 artist - album 分类目录（同专辑多歌手时用主歌手）
+    organize_mp3_by_artist_album(res_root, dry_run, args.force_rename)
 
     # 目录可能变化，重扫
     album_dirs = find_leaf_mp3_dirs(res_root)
@@ -779,7 +921,7 @@ def main():
         cover_src = pick_cover_source_mp3(d)
         cover_file = pick_cover_file(d) or (d / "Cover.jpg")
 
-        def _try_fetch_netease_cover() -> Optional[Path]:
+        def _try_fetch_online_cover() -> Optional[Path]:
             mp3_for_tags = cover_src or pick_first_mp3_recursive(d)
             tags = read_id3_basic(mp3_for_tags) if mp3_for_tags else {}
             artist = tags.get("artist", "")
@@ -792,7 +934,7 @@ def main():
                 return None
             if not is_image_decodable(ffmpeg, target):
                 return None
-            print(f"[COVER] 网易云封面拉取成功：{artist} - {album}")
+            print(f"[COVER] 在线封面拉取成功：{artist} - {album}")
             for m in d.rglob("*.mp3"):
                 write_apic(m, target)
             return target
@@ -803,12 +945,15 @@ def main():
                 extract_apic_to_jpg(cover_src, cover_file)
                 print(f"[COVER] 使用现有 APIC：{cover_src.name}")
         else:
-            # 情况 2：全目录无 APIC → 拉网易云
-            fetched = _try_fetch_netease_cover()
-            if not fetched:
-                print(f"[SKIP] 拉取网易云封面失败：{d}")
-                continue
-            cover_file = fetched
+            # 情况 2：全目录无 APIC → 若已有封面文件则不拉在线封面
+            if cover_file.exists():
+                print(f"[COVER] 目录已有封面文件，跳过在线拉取：{d}")
+            else:
+                fetched = _try_fetch_online_cover()
+                if not fetched:
+                    print(f"[SKIP] 拉取在线封面失败：{d}")
+                    continue
+                cover_file = fetched
 
         cover_file = pick_cover_file(d) or (d / "Cover.jpg")
         if not cover_file.exists():
@@ -853,14 +998,14 @@ def main():
                             cover_file = target
                             print(f"[COVER] 重新提取封面：{cover_src.name}")
                         else:
-                            fetched = _try_fetch_netease_cover()
+                            fetched = _try_fetch_online_cover()
                             if fetched:
                                 cover_file = fetched
                             else:
                                 print(f"[SKIP] 封面无法解码且修复失败：{d}")
                                 continue
                     else:
-                        fetched = _try_fetch_netease_cover()
+                        fetched = _try_fetch_online_cover()
                         if fetched:
                             cover_file = fetched
                         else:
