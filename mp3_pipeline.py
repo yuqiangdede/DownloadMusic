@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-只处理 project/res/*：
+只处理 project/res/*，输出到 project/dist/*：
 
-0) 用 Unlock Music CLI(um.exe) 把 res/**.ncm 转成 mp3（每目录批量）
+0) 用 Unlock Music CLI(um.exe) 把 res/**.ncm 转成 mp3（每目录批量）到 dist
    - 修复 Windows 下 subprocess 输出解码报错（GBK/UTF-8 混杂）
    - 尝试写入 NCM 内嵌封面（补齐 MP3 封面）
-1) 按 artist - album 分类目录（用 ID3，避免 ffprobe 标签乱码）
-2) 递归重命名 mp3：{track} - {titlepart}.mp3（titlepart 取原文件名最后一个 "- " 后的部分）
-3) 每目录统一封面：选该目录下第一个含 ID3 APIC 的 mp3 作为封面源
-4) 每个 mp3 用“目录封面图片”+自己的音频生成同名 mp4
+1) 在 dist 内按 artist - album 分类目录（用 ID3，避免 ffprobe 标签乱码）
+2) 在 dist 内递归重命名 mp3：{track} - {titlepart}.mp3（titlepart 取原文件名最后一个 "- " 后的部分）
+3) 在 dist 内每目录统一封面：选该目录下第一个含 ID3 APIC 的 mp3 作为封面源
+4) 在 dist 内每个 mp3 用“目录封面图片”+自己的音频生成同名 mp4
    - 封面如果长边>720才缩到720，保持比例，不放大
    - 这里会落地一个目录级 Cover.jpg（只生成一次，避免重复抽取）
 """
@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import time
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -84,6 +85,8 @@ def run_cmd_bytes(
             timeout=timeout_sec,
         )
         return p.returncode, p.stdout, p.stderr
+    except OSError as e:
+        return 127, b"", str(e).encode("utf-8", errors="replace")
     except subprocess.TimeoutExpired as e:
         outb = e.stdout if e.stdout else b""
         errb = e.stderr if e.stderr else b""
@@ -107,6 +110,65 @@ def collect_audio_files(dir_path: Path) -> set[Path]:
         for p in dir_path.iterdir()
         if p.is_file() and p.suffix.lower() in audio_exts
     }
+
+
+def map_to_dist(res_root: Path, dist_root: Path, src_path: Path) -> Path:
+    return dist_root / src_path.relative_to(res_root)
+
+
+def ensure_dir(path: Path, dry_run: bool) -> None:
+    if path.exists():
+        return
+    if not dry_run:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def copy_if_missing(src: Path, dst: Path, dry_run: bool) -> bool:
+    if dst.exists():
+        try:
+            if src.stat().st_size == dst.stat().st_size:
+                return True
+        except Exception:
+            return True
+        print(f"[WARN] 目标已存在且大小不同，跳过复制：{dst}")
+        return False
+    print(f"[INFO] 复制：{src} -> {dst}")
+    if not dry_run:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except Exception as e:
+            print(f"[WARN] 复制失败：{src} err={e}", file=sys.stderr)
+            return False
+    return True
+
+
+def sync_audio_from_res_to_dist(res_root: Path, dist_root: Path, dry_run: bool) -> None:
+    for src in res_root.rglob("*"):
+        if not src.is_file():
+            continue
+        if src.suffix.lower() not in (".mp3", ".flac", ".wav", ".m4a"):
+            continue
+        dst = map_to_dist(res_root, dist_root, src)
+        copy_if_missing(src, dst, dry_run)
+
+
+def sync_cover_from_res_to_dist(res_root: Path, dist_root: Path, dry_run: bool) -> None:
+    for src in res_root.rglob("*"):
+        if not src.is_file():
+            continue
+        if src.name not in ("Cover.jpg", "Cover.png"):
+            continue
+        dst = map_to_dist(res_root, dist_root, src)
+        copy_if_missing(src, dst, dry_run)
+
+
+def sync_lyrics_from_res_to_dist(res_root: Path, dist_root: Path, dry_run: bool) -> None:
+    for src in res_root.rglob("*.lrc"):
+        if not src.is_file():
+            continue
+        dst = map_to_dist(res_root, dist_root, src)
+        copy_if_missing(src, dst, dry_run)
 
 
 def extract_ncm_cover_bytes(ncm_path: Path) -> Optional[bytes]:
@@ -608,14 +670,11 @@ def organize_mp3_by_artist_album(
         if not mp3.is_file():
             continue
         tags = read_id3_basic(mp3)
-        album = (tags.get("album") or "").strip()
-        if not album:
-            continue
+        album = (tags.get("album") or "").strip() or "Unknown Album"
+        artist = (tags.get("artist") or "").strip() or "Unknown Artist"
         album_to_mp3s.setdefault(album, []).append(mp3)
-        artist = (tags.get("artist") or "").strip()
-        if artist:
-            counts = album_to_artist_counts.setdefault(album, {})
-            counts[artist] = counts.get(artist, 0) + 1
+        counts = album_to_artist_counts.setdefault(album, {})
+        counts[artist] = counts.get(artist, 0) + 1
 
     for album, mp3s in album_to_mp3s.items():
         artist_counts = album_to_artist_counts.get(album, {})
@@ -624,6 +683,7 @@ def organize_mp3_by_artist_album(
         artist = max(artist_counts.items(), key=lambda item: item[1])[0] if artist_counts else ""
         folder_name = sanitize_windows_name(f"{artist} - {album}" if artist else album)
         target_dir = res_root / folder_name
+        moved_cover_from: set[Path] = set()
         if not target_dir.exists():
             print(f"[INFO] 创建目录：{target_dir}")
             if not dry_run:
@@ -636,6 +696,22 @@ def organize_mp3_by_artist_album(
                 continue
             new_path = target_dir / mp3.name
             safe_rename(mp3, new_path, dry_run, force_rename)
+            lrc_src = mp3.with_suffix(".lrc")
+            if lrc_src.exists():
+                lrc_dst = target_dir / lrc_src.name
+                safe_rename(lrc_src, lrc_dst, dry_run, force_rename)
+            src_dir = mp3.parent
+            if src_dir in moved_cover_from:
+                continue
+            moved_cover_from.add(src_dir)
+            for cover_name in ("Cover.jpg", "Cover.png"):
+                cover_src = src_dir / cover_name
+                if not cover_src.exists():
+                    continue
+                cover_dst = target_dir / cover_name
+                if cover_dst.exists():
+                    continue
+                safe_rename(cover_src, cover_dst, dry_run, force_rename)
 
 
 def gen_mp4_with_cover_jpg(
@@ -644,6 +720,7 @@ def gen_mp4_with_cover_jpg(
     cover_jpg: Path,
     audio_mp3: Path,
     out_mp4: Path,
+    lrc_path: Optional[Path],
     use_gpu: bool,
     dry_run: bool,
     overwrite: bool,
@@ -654,11 +731,36 @@ def gen_mp4_with_cover_jpg(
     ffmpeg_cpu_retries = 1
 
     scale_filter = "scale=720:-1"
+    subtitle_filter = ""
+    srt_path: Optional[Path] = None
+    temp_srt_path: Optional[Path] = None
+    if lrc_path and lrc_path.exists():
+        srt_path = lrc_path.with_suffix(".srt")
+        ok = ensure_srt_for_lrc(lrc_path, srt_path, dry_run)
+        if ok:
+            subtitle_source = srt_path
+            if needs_safe_subtitle_path(srt_path):
+                temp_srt_path = make_safe_subtitle_path(srt_path)
+                if not dry_run:
+                    try:
+                        temp_srt_path.write_bytes(srt_path.read_bytes())
+                    except Exception as e:
+                        print(
+                            f"[WARN] 复制 SRT 失败：{srt_path} err={e}",
+                            file=sys.stderr,
+                        )
+                        temp_srt_path = None
+                if temp_srt_path and temp_srt_path.exists():
+                    subtitle_source = temp_srt_path
+            subtitle_filter = f"subtitles={ffmpeg_filter_path(subtitle_source)}"
 
     # 输出文件（与命令行保持一致）
     out_file = out_mp4
 
     def _build_cmd(codec: str) -> List[str]:
+        vf = scale_filter
+        if subtitle_filter:
+            vf = f"{scale_filter},{subtitle_filter}"
         return [
             ffmpeg,
             "-loop",
@@ -674,7 +776,7 @@ def gen_mp4_with_cover_jpg(
             "-b:a",
             "192k",
             "-vf",
-            scale_filter,
+            vf,
             "-shortest",
             str(windows_input_path(out_file)),
         ]
@@ -727,10 +829,20 @@ def gen_mp4_with_cover_jpg(
     if status != "ok":
         if status == "timeout":
             print(f"[WARN] ffmpeg 超时，跳过：{out_mp4}", file=sys.stderr)
+        if temp_srt_path and temp_srt_path.exists() and not dry_run:
+            try:
+                temp_srt_path.unlink()
+            except Exception:
+                pass
         return False
 
     # 生成成功后校验输出文件
     if not out_file.exists() or out_file.stat().st_size == 0:
+        if temp_srt_path and temp_srt_path.exists() and not dry_run:
+            try:
+                temp_srt_path.unlink()
+            except Exception:
+                pass
         return False
     if not is_mp4_ok(ffprobe, out_file):
         print(f"[WARN] 生成的 MP4 校验失败，将重试时重建：{out_mp4}", file=sys.stderr)
@@ -738,7 +850,22 @@ def gen_mp4_with_cover_jpg(
             out_file.unlink()
         except Exception:
             pass
+        if temp_srt_path and temp_srt_path.exists() and not dry_run:
+            try:
+                temp_srt_path.unlink()
+            except Exception:
+                pass
         return False
+    if temp_srt_path and temp_srt_path.exists() and not dry_run:
+        try:
+            temp_srt_path.unlink()
+        except Exception:
+            pass
+    if srt_path and srt_path.exists() and not dry_run:
+        try:
+            srt_path.unlink()
+        except Exception:
+            pass
     return out_file.exists() and is_mp4_ok(ffprobe, out_file)
 
 
@@ -783,6 +910,280 @@ def is_mp4_ok(ffprobe: str, mp4: Path) -> bool:
         return False
 
 
+def parse_lrc_timestamp(ts: str) -> Optional[float]:
+    try:
+        if ":" not in ts:
+            return None
+        mm, rest = ts.split(":", 1)
+        if "." in rest:
+            ss, frac = rest.split(".", 1)
+        else:
+            ss, frac = rest, "0"
+        minutes = int(mm)
+        seconds = int(ss)
+        frac = (frac + "00")[:2]
+        centis = int(frac)
+        return minutes * 60 + seconds + centis / 100.0
+    except Exception:
+        return None
+
+
+def parse_lrc_lines(lrc_text: str) -> List[Tuple[float, str]]:
+    items: List[Tuple[float, str]] = []
+    for raw in lrc_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        tags = re.findall(r"\[(\d{1,2}:\d{2}(?:\.\d{1,3})?)\]", line)
+        if not tags:
+            continue
+        text = re.sub(r"\[[^\]]+\]", "", line).strip()
+        if not text:
+            continue
+        for ts in tags:
+            t = parse_lrc_timestamp(ts)
+            if t is not None:
+                items.append((t, text))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def srt_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    ms = int(round(seconds * 1000))
+    h = ms // 3600000
+    ms -= h * 3600000
+    m = ms // 60000
+    ms -= m * 60000
+    s = ms // 1000
+    ms -= s * 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def ensure_srt_for_lrc(lrc_path: Path, srt_path: Path, dry_run: bool) -> bool:
+    try:
+        if srt_path.exists() and srt_path.stat().st_size > 0:
+            return True
+        data = lrc_path.read_bytes()
+        lrc_text = decode_bytes(data)
+        items = parse_lrc_lines(lrc_text)
+        if not items:
+            print(f"[WARN] LRC 无有效歌词行：{lrc_path}", file=sys.stderr)
+            return False
+        lines: List[str] = []
+        for i, (start, text) in enumerate(items, start=1):
+            end = items[i][0] - 0.01 if i < len(items) else start + 3.0
+            if end <= start:
+                end = start + 2.0
+            lines.append(str(i))
+            lines.append(f"{srt_timestamp(start)} --> {srt_timestamp(end)}")
+            lines.append(text)
+            lines.append("")
+        srt_text = "\n".join(lines)
+        if not dry_run:
+            srt_path.write_text(srt_text, encoding="utf-8")
+        return True
+    except Exception as e:
+        print(f"[WARN] 生成 SRT 失败：{lrc_path} err={e}", file=sys.stderr)
+        return False
+
+
+def ffmpeg_filter_path(path: Path) -> str:
+    p = str(path.resolve())
+    p = p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"'{p}'"
+
+
+def needs_safe_subtitle_path(path: Path) -> bool:
+    name = path.name
+    if "'" in name or '"' in name:
+        return True
+    try:
+        name.encode("ascii")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def make_safe_subtitle_path(src: Path) -> Path:
+    digest = hashlib.sha1(str(src).encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return src.with_name(f"__sub_{digest}.srt")
+
+
+def parse_lrc_metadata(text: str) -> Dict[str, str]:
+    meta: Dict[str, str] = {}
+    for m in re.finditer(r"\[(ti|ar|al):([^\]]*)\]", text, flags=re.IGNORECASE):
+        key = m.group(1).lower()
+        if key not in meta:
+            meta[key] = m.group(2).strip()
+    return meta
+
+
+def norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def strip_track_prefix_from_stem(stem: str) -> str:
+    m = re.match(r"^\d+\s*-\s*(.+)$", stem)
+    return m.group(1).strip() if m else stem.strip()
+
+
+def split_stem_artist_title(stem: str) -> Tuple[str, str]:
+    if " - " in stem:
+        artist, title = stem.split(" - ", 1)
+        return artist.strip(), title.strip()
+    return "", stem.strip()
+
+
+def align_lrc_with_mp3(dist_root: Path, dry_run: bool) -> None:
+    lrc_entries = []
+    for lrc in dist_root.rglob("*.lrc"):
+        if not lrc.is_file():
+            continue
+        try:
+            text = decode_bytes(lrc.read_bytes())
+        except Exception:
+            text = ""
+        meta = parse_lrc_metadata(text)
+        stem_artist, stem_title = split_stem_artist_title(lrc.stem)
+        lrc_entries.append(
+            {
+                "path": lrc,
+                "title": norm_text(meta.get("ti", "")),
+                "artist": norm_text(meta.get("ar", "")),
+                "album": norm_text(meta.get("al", "")),
+                "stem": norm_text(lrc.stem),
+                "stem_strip": norm_text(strip_track_prefix_from_stem(lrc.stem)),
+                "stem_artist": norm_text(stem_artist),
+                "stem_title": norm_text(stem_title),
+            }
+        )
+
+    used: set[Path] = set()
+
+    for mp3 in dist_root.rglob("*.mp3"):
+        if not mp3.is_file():
+            continue
+        dst = mp3.with_suffix(".lrc")
+        if dst.exists():
+            continue
+        tags = read_id3_basic(mp3)
+        title = norm_text(tags.get("title") or "")
+        artist = norm_text(tags.get("artist") or "")
+        stem_norm = norm_text(mp3.stem)
+        stem_strip = norm_text(strip_track_prefix_from_stem(mp3.stem))
+
+        candidate = None
+        # 1) 同目录同名/去 track 前缀匹配
+        for e in lrc_entries:
+            if e["path"] in used:
+                continue
+            if e["path"].parent != mp3.parent:
+                continue
+            if e["stem"] == stem_norm or e["stem_strip"] == stem_strip:
+                candidate = e
+                break
+        # 1.5) 同目录按文件名提取的标题匹配（常见：Artist - Title.lrc）
+        if not candidate:
+            for e in lrc_entries:
+                if e["path"] in used or e["path"].parent != mp3.parent:
+                    continue
+                if not e["stem_title"]:
+                    continue
+                if e["stem_title"] != stem_strip:
+                    continue
+                if artist and e["stem_artist"] and e["stem_artist"] != artist:
+                    continue
+                candidate = e
+                break
+        # 2) 同目录按标题/歌手匹配
+        if not candidate and title:
+            for e in lrc_entries:
+                if e["path"] in used or e["path"].parent != mp3.parent:
+                    continue
+                if (
+                    (e["title"] == title or e["stem_title"] == title)
+                    and (not e["artist"] or e["artist"] == artist)
+                ):
+                    candidate = e
+                    break
+        # 3) 全局按标题/歌手匹配
+        if not candidate and title:
+            for e in lrc_entries:
+                if e["path"] in used:
+                    continue
+                if (
+                    (e["title"] == title or e["stem_title"] == title)
+                    and (not e["artist"] or e["artist"] == artist)
+                ):
+                    candidate = e
+                    break
+        # 4) 全局文件名匹配
+        if not candidate:
+            for e in lrc_entries:
+                if e["path"] in used:
+                    continue
+                if (
+                    e["stem"] == stem_norm
+                    or e["stem_strip"] == stem_strip
+                    or e["stem_title"] == stem_strip
+                ):
+                    if artist and e["stem_artist"] and e["stem_artist"] != artist:
+                        continue
+                    candidate = e
+                    break
+
+        if not candidate:
+            continue
+        src = candidate["path"]
+        if src.resolve() == dst.resolve():
+            used.add(src)
+            continue
+        safe_rename(src, dst, dry_run, force_suffix_on_conflict=True)
+        used.add(src)
+
+
+def clean_dist_outputs(dist_root: Path, album_dirs: List[Path], dry_run: bool) -> None:
+    keep_dirs = {d.resolve() for d in album_dirs}
+    keep_names = {"Cover.jpg", "Cover.png"}
+    keep_exts = {".mp3", ".mp4", ".lrc"}
+
+    for child in dist_root.iterdir():
+        if child.resolve() in keep_dirs:
+            continue
+        print(f"[DEDUP] 清理非专辑目录/文件：{child}")
+        if not dry_run:
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except Exception as e:
+                print(f"[WARN] 清理失败：{child} err={e}", file=sys.stderr)
+
+    for d in album_dirs:
+        for p in d.rglob("*"):
+            if p.is_dir():
+                print(f"[DEDUP] 清理子目录：{p}")
+                if not dry_run:
+                    try:
+                        shutil.rmtree(p)
+                    except Exception as e:
+                        print(f"[WARN] 清理失败：{p} err={e}", file=sys.stderr)
+                continue
+            if p.name in keep_names:
+                continue
+            if p.suffix.lower() in keep_exts:
+                continue
+            print(f"[DEDUP] 清理非输出文件：{p}")
+            if not dry_run:
+                try:
+                    p.unlink()
+                except Exception as e:
+                    print(f"[WARN] 清理失败：{p} err={e}", file=sys.stderr)
+
+
 def find_um_exe(project_root: Path) -> Optional[Path]:
     candidates = [
         project_root / "tools" / "um.exe",
@@ -798,10 +1199,27 @@ def find_um_exe(project_root: Path) -> Optional[Path]:
     return None
 
 
+def build_um_cmd(um: Path, output_dir: Path, input_path: Path) -> List[str]:
+    base = [str(um), "-o", str(output_dir), str(input_path)]
+    if os.name == "nt":
+        suffix = um.suffix.lower()
+        if suffix in (".cmd", ".bat"):
+            return ["cmd", "/c"] + base
+        if suffix == ".ps1":
+            return [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ] + base
+    return base
+
+
 def convert_ncm_to_mp3(
     um: Path, input_path: Path, output_dir: Path, dry_run: bool
 ) -> bool:
-    cmd = [str(um), "-o", str(output_dir), str(input_path)]
+    cmd = build_um_cmd(um, output_dir, input_path)
     print(f"[NCM->MP3] {input_path} -> {output_dir}  (via {um.name})")
     if dry_run:
         return True
@@ -840,6 +1258,7 @@ def main():
         description="只处理 res/：NCM->MP3 + 重命名 + 每目录统一封面生成 MP4"
     )
     ap.add_argument("--root", default=".", help="项目根目录（包含 res/）")
+    ap.add_argument("--dist", default="dist", help="输出目录（相对于项目根目录）")
     ap.add_argument("--dry-run", action="store_true", help="只打印不执行")
     ap.add_argument("--no-gpu", action="store_true", help="不用 NVENC，改用 libx264")
     ap.add_argument("--overwrite", action="store_true", help="覆盖已存在的 mp4")
@@ -857,9 +1276,13 @@ def main():
 
     project_root = Path(args.root).resolve()
     res_root = project_root / "res"
+    dist_root = project_root / args.dist
 
     if not res_root.exists() or not res_root.is_dir():
         print(f"[FATAL] 未找到 res 目录：{res_root}", file=sys.stderr)
+        sys.exit(2)
+    if dist_root.resolve() == res_root.resolve():
+        print("[FATAL] dist 不能与 res 相同。", file=sys.stderr)
         sys.exit(2)
 
     ffmpeg = which_or_die("ffmpeg")
@@ -870,9 +1293,12 @@ def main():
 
     print(f"[PROJECT] {project_root}")
     print(f"[RES] {res_root}")
+    print(f"[DIST] {dist_root}")
     print(
         f"[MODE] dry_run={dry_run} use_gpu={use_gpu} overwrite={args.overwrite} force_rename={args.force_rename}"
     )
+
+    ensure_dir(dist_root, dry_run)
 
     # Step 0: NCM -> MP3
     if not args.skip_ncm:
@@ -883,23 +1309,34 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(2)
+        if um.exists() and um.is_file() and um.stat().st_size == 0:
+            print(
+                f"[FATAL] um 可执行文件为空（0 字节）：{um}\n"
+                "请重新下载/放置正确的 Unlock Music CLI。",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         ncm_files = [p for p in res_root.rglob("*.ncm") if p.is_file()]
         for ncm in ncm_files:
+            out_dir = map_to_dist(res_root, dist_root, ncm.parent)
+            ensure_dir(out_dir, dry_run)
             convert_ncm_to_mp3(
-                um=um, input_path=ncm, output_dir=ncm.parent, dry_run=dry_run
+                um=um, input_path=ncm, output_dir=out_dir, dry_run=dry_run
             )
 
-    # Step 1: 按 artist - album 分类目录（同专辑多歌手时用主歌手）
-    organize_mp3_by_artist_album(res_root, dry_run, args.force_rename)
+    # Step 0.5: 复制已有音频/封面到 dist
+    sync_audio_from_res_to_dist(res_root, dist_root, dry_run)
+    sync_cover_from_res_to_dist(res_root, dist_root, dry_run)
+    sync_lyrics_from_res_to_dist(res_root, dist_root, dry_run)
 
-    # 目录可能变化，重扫
-    album_dirs = find_leaf_mp3_dirs(res_root)
+    # Step 1: 按 artist - album 分类目录（同专辑多歌手时用主歌手）
+    organize_mp3_by_artist_album(dist_root, dry_run, args.force_rename)
 
     # Step 2: 重命名 mp3
     # 断点续跑去重：如果已存在 '{track} - {title}.mp3'，删除同内容的 'artist - title.mp3'
-    dedupe_mp3_when_track_exists(res_root, dry_run)
-    for mp3 in res_root.rglob("*.mp3"):
+    dedupe_mp3_when_track_exists(dist_root, dry_run)
+    for mp3 in dist_root.rglob("*.mp3"):
         if not mp3.is_file():
             continue
         tags = read_id3_basic(mp3)
@@ -913,6 +1350,16 @@ def main():
         new_stem = sanitize_windows_name(f"{track} - {title_part}")
         new_path = mp3.with_name(new_stem + mp3.suffix)
         safe_rename(mp3, new_path, dry_run, args.force_rename)
+        lrc_path = mp3.with_suffix(".lrc")
+        if lrc_path.exists():
+            lrc_new = new_path.with_suffix(".lrc")
+            safe_rename(lrc_path, lrc_new, dry_run, args.force_rename)
+
+    # LRC 归位并与 mp3 同名
+    align_lrc_with_mp3(dist_root, dry_run)
+
+    # 目录可能变化，重扫
+    album_dirs = find_leaf_mp3_dirs(dist_root)
 
     # Step 3/4: 每目录统一封面（APIC）+ 生成 MP4
     for d in album_dirs:
@@ -1025,10 +1472,14 @@ def main():
                 cover_jpg=cover_file,
                 audio_mp3=mp3,
                 out_mp4=out_mp4,
+                lrc_path=mp3.with_suffix(".lrc"),
                 use_gpu=use_gpu,
                 dry_run=dry_run,
                 overwrite=args.overwrite,
             )
+
+    # Step 5: 清理 dist，仅保留 “歌手-专辑” 目录中的 mp3/mp4/cover
+    clean_dist_outputs(dist_root, album_dirs, dry_run)
 
     print("[DONE]")
 
