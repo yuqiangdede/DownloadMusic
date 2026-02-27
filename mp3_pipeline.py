@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -649,6 +650,142 @@ def pick_cover_source_mp3(top_dir: Path) -> Optional[Path]:
     return None
 
 
+def prepare_cover_for_dir(
+    d: Path,
+    ffmpeg: str,
+    ffprobe: str,
+    dry_run: bool,
+    allow_online_fetch: bool = True,
+) -> Optional[Path]:
+    from netease_cover import fetch_album_cover
+
+    print(f"[COVER] 准备封面：{d}")
+
+    cover_src = pick_cover_source_mp3(d)
+    cover_file = pick_cover_file(d) or (d / "Cover.jpg")
+    # 若有 APIC，优先使用 MP3 内嵌封面；不锁定已有封面文件
+    cover_locked = cover_file.exists() and not cover_src
+
+    def _try_fetch_online_cover() -> Optional[Path]:
+        if not allow_online_fetch:
+            return None
+        mp3_for_tags = cover_src or pick_first_mp3_recursive(d)
+        tags = read_id3_basic(mp3_for_tags) if mp3_for_tags else {}
+        artist = tags.get("artist", "")
+        album = tags.get("album", "")
+        if not artist or not album:
+            return None
+        target = d / "Cover.jpg"
+        ok = fetch_album_cover(artist, album, target)
+        if not ok:
+            return None
+        if not is_image_decodable(ffmpeg, target):
+            return None
+        print(f"[COVER] 在线封面拉取成功：{artist} - {album}")
+        for m in d.rglob("*.mp3"):
+            write_apic(m, target)
+        return target
+
+    if cover_src:
+        # 情况 1：优先从 MP3 的 APIC 提取（即使已有封面文件）
+        ok = extract_apic_to_jpg(cover_src, cover_file)
+        if ok:
+            print(f"[COVER] 使用现有 APIC：{cover_src.name}")
+        else:
+            # APIC 提取失败时再回退到已有封面或在线拉取
+            if cover_file.exists():
+                print(f"[COVER] APIC 提取失败，使用目录已有封面：{cover_file.name}")
+            else:
+                fetched = _try_fetch_online_cover()
+                if not fetched:
+                    if allow_online_fetch:
+                        print(f"[SKIP] 拉取在线封面失败：{d}")
+                    else:
+                        print(f"[SKIP] 未获取封面(禁用在线拉取)：{d}")
+                    return None
+                cover_file = fetched
+    else:
+        if cover_locked:
+            print(f"[COVER] 目录已有封面文件，按现有封面生成：{cover_file.name}")
+        else:
+            # 情况 2：全目录无 APIC → 若已有封面文件则不拉在线封面
+            if cover_file.exists():
+                print(f"[COVER] 目录已有封面文件，跳过在线拉取：{d}")
+            else:
+                fetched = _try_fetch_online_cover()
+                if not fetched:
+                    if allow_online_fetch:
+                        print(f"[SKIP] 拉取在线封面失败：{d}")
+                    else:
+                        print(f"[SKIP] 未获取封面(禁用在线拉取)：{d}")
+                    return None
+                cover_file = fetched
+
+    cover_file = pick_cover_file(d) or (d / "Cover.jpg")
+    if not cover_file.exists():
+        if not cover_src:
+            print(f"[SKIP] 无封面来源，跳过生成：{d}")
+            return None
+        ok = extract_apic_to_jpg(cover_src, cover_file)
+        if not ok:
+            print(f"[SKIP] 提取封面失败，跳过生成：{d}")
+            return None
+        print(f"[COVER] {cover_src.name} -> {cover_file}")
+
+    if not cover_locked:
+        cover_file = normalize_cover_extension(cover_file, ffprobe)
+        if cover_file.exists() and not is_image_decodable(ffmpeg, cover_file):
+            alt_cover = None
+            if cover_file.name.lower() == "cover.jpg":
+                alt_cover = d / "Cover.png"
+            elif cover_file.name.lower() == "cover.png":
+                alt_cover = d / "Cover.jpg"
+
+            if (
+                alt_cover
+                and alt_cover.exists()
+                and is_image_decodable(ffmpeg, alt_cover)
+            ):
+                print(f"[COVER] 当前封面损坏，改用备用：{alt_cover.name}")
+                cover_file = alt_cover
+            else:
+                ok = fix_cover_image(ffmpeg, cover_file)
+                if ok:
+                    print(f"[COVER] 封面损坏，已修复：{cover_file}")
+                else:
+                    # 尝试从 APIC 重新提取
+                    if cover_src:
+                        try:
+                            cover_file.unlink()
+                        except Exception:
+                            pass
+                        target = d / "Cover.jpg"
+                        ok2 = extract_apic_to_jpg(cover_src, target)
+                        if ok2 and is_image_decodable(ffmpeg, target):
+                            cover_file = target
+                            print(f"[COVER] 重新提取封面：{cover_src.name}")
+                        else:
+                            fetched = _try_fetch_online_cover()
+                            if fetched:
+                                cover_file = fetched
+                            else:
+                                print(f"[SKIP] 封面无法解码且修复失败：{d}")
+                                return None
+                    else:
+                        fetched = _try_fetch_online_cover()
+                        if fetched:
+                            cover_file = fetched
+                        else:
+                            print(f"[SKIP] 封面无法解码且修复失败：{d}")
+                            return None
+    else:
+        if cover_file.exists() and not is_image_decodable(ffmpeg, cover_file):
+            print(f"[WARN] 封面文件无法解码，按要求不替换，跳过生成：{d}", file=sys.stderr)
+            return None
+
+    return cover_file if cover_file.exists() else None
+
+
 def find_leaf_mp3_dirs(res_root: Path) -> List[Path]:
     mp3_dirs = {p.parent for p in res_root.rglob("*.mp3") if p.is_file()}
     parents_with_children: set[Path] = set()
@@ -738,21 +875,26 @@ def gen_mp4_with_cover_jpg(
         srt_path = lrc_path.with_suffix(".srt")
         ok = ensure_srt_for_lrc(lrc_path, srt_path, dry_run)
         if ok:
-            subtitle_source = srt_path
+            subtitle_source: Optional[Path] = srt_path
             if needs_safe_subtitle_path(srt_path):
                 temp_srt_path = make_safe_subtitle_path(srt_path)
                 if not dry_run:
                     try:
+                        temp_srt_path.parent.mkdir(parents=True, exist_ok=True)
                         temp_srt_path.write_bytes(srt_path.read_bytes())
                     except Exception as e:
                         print(
                             f"[WARN] 复制 SRT 失败：{srt_path} err={e}",
                             file=sys.stderr,
                         )
+                        subtitle_source = None
                         temp_srt_path = None
-                if temp_srt_path and temp_srt_path.exists():
+                if temp_srt_path and (dry_run or temp_srt_path.exists()):
                     subtitle_source = temp_srt_path
-            subtitle_filter = f"subtitles={ffmpeg_filter_path(subtitle_source)}"
+            if subtitle_source:
+                subtitle_filter = f"subtitles={ffmpeg_filter_path(subtitle_source)}"
+            else:
+                print(f"[WARN] 字幕文件不可用，将按无字幕生成：{audio_mp3}", file=sys.stderr)
 
     # 输出文件（与命令行保持一致）
     out_file = out_mp4
@@ -806,6 +948,23 @@ def gen_mp4_with_cover_jpg(
             return "error"
         return "timeout"
 
+    def _cleanup_temp_srt() -> None:
+        if temp_srt_path and temp_srt_path.exists() and not dry_run:
+            try:
+                temp_srt_path.unlink()
+            except Exception:
+                pass
+
+    def _encode_with_codec_fallback(codec: str) -> str:
+        status = _try_ffmpeg(codec, ffmpeg_timeout_retries, "GPU" if use_gpu else "CPU")
+        if status == "timeout" and use_gpu:
+            print(
+                f"[WARN] GPU 编码连续超时，改用 libx264 再试 {ffmpeg_cpu_retries} 次：{out_mp4}",
+                file=sys.stderr,
+            )
+            status = _try_ffmpeg("libx264", ffmpeg_cpu_retries, "CPU")
+        return status
+
     print(
         f"[MP4] cover={cover_jpg.name} audio={audio_mp3.name} -> {out_mp4.name} (vcodec={vcodec})"
     )
@@ -818,31 +977,20 @@ def gen_mp4_with_cover_jpg(
             return True
         print(f"[WARN] 检测到损坏/不完整 MP4，将重建：{out_mp4}")
 
-    status = _try_ffmpeg(vcodec, ffmpeg_timeout_retries, "GPU" if use_gpu else "CPU")
-    if status == "timeout" and use_gpu:
-        print(
-            f"[WARN] GPU 编码连续超时，改用 libx264 再试 {ffmpeg_cpu_retries} 次：{out_mp4}",
-            file=sys.stderr,
-        )
-        vcodec = "libx264"
-        status = _try_ffmpeg(vcodec, ffmpeg_cpu_retries, "CPU")
+    status = _encode_with_codec_fallback(vcodec)
+    if status != "ok" and subtitle_filter:
+        print(f"[WARN] 字幕渲染失败，回退为无字幕再试：{out_mp4}", file=sys.stderr)
+        subtitle_filter = ""
+        status = _encode_with_codec_fallback(vcodec)
     if status != "ok":
         if status == "timeout":
             print(f"[WARN] ffmpeg 超时，跳过：{out_mp4}", file=sys.stderr)
-        if temp_srt_path and temp_srt_path.exists() and not dry_run:
-            try:
-                temp_srt_path.unlink()
-            except Exception:
-                pass
+        _cleanup_temp_srt()
         return False
 
     # 生成成功后校验输出文件
     if not out_file.exists() or out_file.stat().st_size == 0:
-        if temp_srt_path and temp_srt_path.exists() and not dry_run:
-            try:
-                temp_srt_path.unlink()
-            except Exception:
-                pass
+        _cleanup_temp_srt()
         return False
     if not is_mp4_ok(ffprobe, out_file):
         print(f"[WARN] 生成的 MP4 校验失败，将重试时重建：{out_mp4}", file=sys.stderr)
@@ -850,17 +998,9 @@ def gen_mp4_with_cover_jpg(
             out_file.unlink()
         except Exception:
             pass
-        if temp_srt_path and temp_srt_path.exists() and not dry_run:
-            try:
-                temp_srt_path.unlink()
-            except Exception:
-                pass
+        _cleanup_temp_srt()
         return False
-    if temp_srt_path and temp_srt_path.exists() and not dry_run:
-        try:
-            temp_srt_path.unlink()
-        except Exception:
-            pass
+    _cleanup_temp_srt()
     if srt_path and srt_path.exists() and not dry_run:
         try:
             srt_path.unlink()
@@ -996,19 +1136,40 @@ def ffmpeg_filter_path(path: Path) -> str:
 
 
 def needs_safe_subtitle_path(path: Path) -> bool:
-    name = path.name
-    if "'" in name or '"' in name:
+    full = str(path.resolve())
+    if "'" in full or '"' in full:
         return True
     try:
-        name.encode("ascii")
+        full.encode("ascii")
     except UnicodeEncodeError:
         return True
     return False
 
 
+def get_safe_subtitle_temp_dir() -> Path:
+    candidates: List[Path] = []
+    candidates.append(Path(tempfile.gettempdir()) / "downloadmusic_subtitles")
+    if os.name == "nt":
+        candidates.append(Path("C:/Temp/downloadmusic_subtitles"))
+    candidates.append(Path.cwd() / "__subtitles_tmp")
+
+    for d in candidates:
+        probe = d / "probe.srt"
+        if needs_safe_subtitle_path(probe):
+            continue
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            continue
+    return Path.cwd()
+
+
 def make_safe_subtitle_path(src: Path) -> Path:
     digest = hashlib.sha1(str(src).encode("utf-8", errors="ignore")).hexdigest()[:8]
-    return src.with_name(f"__sub_{digest}.srt")
+    token = f"{os.getpid()}_{time.time_ns()}"
+    safe_dir = get_safe_subtitle_temp_dir()
+    return safe_dir / f"__sub_{digest}_{token}.srt"
 
 
 def parse_lrc_metadata(text: str) -> Dict[str, str]:
@@ -1363,101 +1524,9 @@ def main():
 
     # Step 3/4: 每目录统一封面（APIC）+ 生成 MP4
     for d in album_dirs:
-        from netease_cover import fetch_album_cover
-
-        cover_src = pick_cover_source_mp3(d)
-        cover_file = pick_cover_file(d) or (d / "Cover.jpg")
-
-        def _try_fetch_online_cover() -> Optional[Path]:
-            mp3_for_tags = cover_src or pick_first_mp3_recursive(d)
-            tags = read_id3_basic(mp3_for_tags) if mp3_for_tags else {}
-            artist = tags.get("artist", "")
-            album = tags.get("album", "")
-            if not artist or not album:
-                return None
-            target = d / "Cover.jpg"
-            ok = fetch_album_cover(artist, album, target)
-            if not ok:
-                return None
-            if not is_image_decodable(ffmpeg, target):
-                return None
-            print(f"[COVER] 在线封面拉取成功：{artist} - {album}")
-            for m in d.rglob("*.mp3"):
-                write_apic(m, target)
-            return target
-
-        # 情况 1：目录内已有 APIC
-        if cover_src:
-            if not cover_file.exists():
-                extract_apic_to_jpg(cover_src, cover_file)
-                print(f"[COVER] 使用现有 APIC：{cover_src.name}")
-        else:
-            # 情况 2：全目录无 APIC → 若已有封面文件则不拉在线封面
-            if cover_file.exists():
-                print(f"[COVER] 目录已有封面文件，跳过在线拉取：{d}")
-            else:
-                fetched = _try_fetch_online_cover()
-                if not fetched:
-                    print(f"[SKIP] 拉取在线封面失败：{d}")
-                    continue
-                cover_file = fetched
-
-        cover_file = pick_cover_file(d) or (d / "Cover.jpg")
-        if not cover_file.exists():
-            if not cover_src:
-                print(f"[SKIP] 无封面来源，跳过生成：{d}")
-                continue
-            ok = extract_apic_to_jpg(cover_src, cover_file)
-            if not ok:
-                print(f"[SKIP] 提取封面失败，跳过生成：{d}")
-                continue
-            print(f"[COVER] {cover_src.name} -> {cover_file}")
-
-        cover_file = normalize_cover_extension(cover_file, ffprobe)
-        if cover_file.exists() and not is_image_decodable(ffmpeg, cover_file):
-            alt_cover = None
-            if cover_file.name.lower() == "cover.jpg":
-                alt_cover = d / "Cover.png"
-            elif cover_file.name.lower() == "cover.png":
-                alt_cover = d / "Cover.jpg"
-
-            if (
-                alt_cover
-                and alt_cover.exists()
-                and is_image_decodable(ffmpeg, alt_cover)
-            ):
-                print(f"[COVER] 当前封面损坏，改用备用：{alt_cover.name}")
-                cover_file = alt_cover
-            else:
-                ok = fix_cover_image(ffmpeg, cover_file)
-                if ok:
-                    print(f"[COVER] 封面损坏，已修复：{cover_file}")
-                else:
-                    # 尝试从 APIC 重新提取
-                    if cover_src:
-                        try:
-                            cover_file.unlink()
-                        except Exception:
-                            pass
-                        target = d / "Cover.jpg"
-                        ok2 = extract_apic_to_jpg(cover_src, target)
-                        if ok2 and is_image_decodable(ffmpeg, target):
-                            cover_file = target
-                            print(f"[COVER] 重新提取封面：{cover_src.name}")
-                        else:
-                            fetched = _try_fetch_online_cover()
-                            if fetched:
-                                cover_file = fetched
-                            else:
-                                print(f"[SKIP] 封面无法解码且修复失败：{d}")
-                                continue
-                    else:
-                        fetched = _try_fetch_online_cover()
-                        if fetched:
-                            cover_file = fetched
-                        else:
-                            print(f"[SKIP] 封面无法解码且修复失败：{d}")
-                            continue
+        cover_file = prepare_cover_for_dir(d, ffmpeg, ffprobe, dry_run)
+        if not cover_file:
+            continue
 
         for mp3 in d.rglob("*.mp3"):
             if not mp3.is_file():
