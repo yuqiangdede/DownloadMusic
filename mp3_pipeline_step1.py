@@ -95,6 +95,7 @@ def main() -> None:
 
     # Step 3: 提取/准备封面（不生成 MP4）
     album_dirs = m.find_leaf_mp3_dirs(dist_root)
+    res_ncm_index = m.build_ncm_title_index(res_root)
     covers_dir = dist_root / "_covers"
     for d in album_dirs:
         _ = m.prepare_cover_for_dir(
@@ -102,6 +103,7 @@ def main() -> None:
             ffmpeg,
             ffprobe,
             args.dry_run,
+            res_ncm_index=res_ncm_index,
             allow_online_fetch=not args.no_online_cover,
         )
         cover_file = m.pick_cover_file(d)
