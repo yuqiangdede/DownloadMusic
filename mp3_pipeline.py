@@ -239,16 +239,25 @@ def try_write_ncm_cover(
     cover_data = extract_ncm_cover_bytes(ncm_path)
     if not cover_data:
         return
+    mime = detect_image_mime_from_bytes(cover_data)
+    cover_name = "Cover.png" if mime == "image/png" else "Cover.jpg"
+    cover_path = output_dir / cover_name
+    if not cover_path.exists():
+        try:
+            cover_path.write_bytes(cover_data)
+            print(f"[COVER] 保存 NCM 封面文件：{cover_path.name}")
+        except Exception as e:
+            print(f"[WARN] 保存封面文件失败：{cover_path} err={e}", file=sys.stderr)
     target = find_ncm_output_audio_file(output_dir, ncm_path, before_files, start_ts)
     if not target:
-        print(f"[WARN] NCM 转换成功但未找到输出文件，跳过写入封面：{ncm_path}")
+        print(f"[WARN] NCM 转换成功但未找到输出文件，跳过写入内嵌封面：{ncm_path}")
         return
     if target.suffix.lower() != ".mp3":
+        print(f"[INFO] 输出不是 MP3，已仅保留封面文件：{target.name}")
         return
     if has_apic(target):
         print(f"[COVER] 已有封面，跳过写入：{target.name}")
         return
-    mime = detect_image_mime_from_bytes(cover_data)
     ok = write_apic_bytes(target, cover_data, mime)
     if ok:
         print(f"[COVER] 写入 NCM 内嵌封面：{target.name}")
@@ -650,11 +659,114 @@ def pick_cover_source_mp3(top_dir: Path) -> Optional[Path]:
     return None
 
 
+def normalize_match_key(text: str) -> str:
+    t = (text or "").strip().casefold()
+    t = re.sub(r"\s+", "", t)
+    return t
+
+
+def title_from_stem_for_match(stem: str) -> str:
+    m = re.match(r"^\d+\s*-\s*(.+)$", stem)
+    if m:
+        return m.group(1).strip()
+    return strip_prefix_before_last_dash_space(stem).strip()
+
+
+def build_ncm_title_index(res_root: Path) -> Dict[str, List[Path]]:
+    index: Dict[str, List[Path]] = {}
+    for ncm in res_root.rglob("*.ncm"):
+        if not ncm.is_file():
+            continue
+        keys = {
+            normalize_match_key(ncm.stem),
+            normalize_match_key(strip_prefix_before_last_dash_space(ncm.stem)),
+        }
+        for key in keys:
+            if not key:
+                continue
+            index.setdefault(key, []).append(ncm)
+    return index
+
+
+def collect_cover_lookup_keys_for_dir(d: Path) -> List[str]:
+    keys: Dict[str, None] = {}
+    for mp3 in sorted(d.rglob("*.mp3"), key=lambda p: str(p).lower()):
+        if not mp3.is_file():
+            continue
+        tags = read_id3_basic(mp3)
+        title = (tags.get("title") or "").strip()
+        if title:
+            key = normalize_match_key(title)
+            if key:
+                keys[key] = None
+        stem_title = title_from_stem_for_match(mp3.stem)
+        if stem_title:
+            key = normalize_match_key(stem_title)
+            if key:
+                keys[key] = None
+    return list(keys.keys())
+
+
+def try_extract_cover_from_res_ncm(
+    d: Path,
+    target_cover: Path,
+    res_ncm_index: Dict[str, List[Path]],
+) -> Optional[Tuple[Path, bytes, str]]:
+    lookup_keys = collect_cover_lookup_keys_for_dir(d)
+    if not lookup_keys:
+        print(f"[COVER] 原始 NCM 封面匹配键为空，跳过：{d.name}")
+        return None
+
+    candidate_ncms: List[Path] = []
+    seen: set[Path] = set()
+    for key in lookup_keys:
+        for ncm in res_ncm_index.get(key, []):
+            try:
+                resolved = ncm.resolve()
+            except Exception:
+                resolved = ncm
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidate_ncms.append(ncm)
+
+    if not candidate_ncms:
+        print(f"[COVER] 原始 NCM 未找到候选文件，后续可能在线拉取：{d.name}")
+        return None
+
+    print(
+        f"[COVER] 尝试从原始 NCM 提取封面：{d.name} "
+        f"(匹配键={len(lookup_keys)} 候选={len(candidate_ncms)})"
+    )
+
+    checked = 0
+    for ncm in candidate_ncms:
+        checked += 1
+        cover_data = extract_ncm_cover_bytes(ncm)
+        if not cover_data:
+            continue
+        try:
+            target_cover.write_bytes(cover_data)
+        except Exception as e:
+            print(
+                f"[WARN] 写入 NCM 封面失败：{target_cover} 来源={ncm.name} err={e}",
+                file=sys.stderr,
+            )
+            continue
+        if target_cover.exists() and target_cover.stat().st_size > 0:
+            print(f"[COVER] 使用 NCM 内嵌封面：{ncm.name}")
+            mime = detect_image_mime_from_bytes(cover_data)
+            return target_cover, cover_data, mime
+    print(f"[COVER] 原始 NCM 未提取到封面：{d.name} (已检查={checked})")
+    return None
+
+
 def prepare_cover_for_dir(
     d: Path,
     ffmpeg: str,
     ffprobe: str,
     dry_run: bool,
+    res_ncm_index: Optional[Dict[str, List[Path]]] = None,
     allow_online_fetch: bool = True,
 ) -> Optional[Path]:
     from netease_cover import fetch_album_cover
@@ -665,6 +777,7 @@ def prepare_cover_for_dir(
     cover_file = pick_cover_file(d) or (d / "Cover.jpg")
     # 若有 APIC，优先使用 MP3 内嵌封面；不锁定已有封面文件
     cover_locked = cover_file.exists() and not cover_src
+    ncm_cover_used = False
 
     def _try_fetch_online_cover() -> Optional[Path]:
         if not allow_online_fetch:
@@ -686,7 +799,24 @@ def prepare_cover_for_dir(
             write_apic(m, target)
         return target
 
-    if cover_src:
+    if not cover_locked and res_ncm_index:
+        ncm_hit = try_extract_cover_from_res_ncm(d, cover_file, res_ncm_index)
+        if ncm_hit and is_image_decodable(ffmpeg, ncm_hit[0]):
+            ncm_cover_used = True
+            cover_file, cover_data, mime = ncm_hit
+            for m in d.rglob("*.mp3"):
+                write_apic_bytes(m, cover_data, mime)
+            cover_src = pick_cover_source_mp3(d) or cover_src
+        elif ncm_hit:
+            print(f"[WARN] NCM 封面不可解码，忽略并回退：{ncm_hit[0]}")
+        else:
+            print(f"[COVER] 未从原始 NCM 命中封面，继续尝试 APIC/在线：{d.name}")
+    elif not res_ncm_index:
+        print(f"[COVER] 未提供原始 NCM 索引，跳过 NCM 提取：{d.name}")
+    elif cover_locked:
+        print(f"[COVER] 目录已有封面且无 APIC 来源，跳过原始 NCM 提取：{d.name}")
+
+    if not ncm_cover_used and cover_src:
         # 情况 1：优先从 MP3 的 APIC 提取（即使已有封面文件）
         ok = extract_apic_to_jpg(cover_src, cover_file)
         if ok:
@@ -704,7 +834,7 @@ def prepare_cover_for_dir(
                         print(f"[SKIP] 未获取封面(禁用在线拉取)：{d}")
                     return None
                 cover_file = fetched
-    else:
+    elif not ncm_cover_used:
         if cover_locked:
             print(f"[COVER] 目录已有封面文件，按现有封面生成：{cover_file.name}")
         else:
@@ -1308,7 +1438,7 @@ def align_lrc_with_mp3(dist_root: Path, dry_run: bool) -> None:
 def clean_dist_outputs(dist_root: Path, album_dirs: List[Path], dry_run: bool) -> None:
     keep_dirs = {d.resolve() for d in album_dirs}
     keep_names = {"Cover.jpg", "Cover.png"}
-    keep_exts = {".mp3", ".mp4", ".lrc"}
+    keep_exts = {".mp3", ".mp4"}
 
     for child in dist_root.iterdir():
         if child.resolve() in keep_dirs:
@@ -1334,6 +1464,16 @@ def clean_dist_outputs(dist_root: Path, album_dirs: List[Path], dry_run: bool) -
                         print(f"[WARN] 清理失败：{p} err={e}", file=sys.stderr)
                 continue
             if p.name in keep_names:
+                continue
+            if p.suffix.lower() == ".lrc":
+                if p.with_suffix(".mp3").exists():
+                    continue
+                print(f"[DEDUP] 清理无对应音频歌词：{p}")
+                if not dry_run:
+                    try:
+                        p.unlink()
+                    except Exception as e:
+                        print(f"[WARN] 清理失败：{p} err={e}", file=sys.stderr)
                 continue
             if p.suffix.lower() in keep_exts:
                 continue
@@ -1521,10 +1661,17 @@ def main():
 
     # 目录可能变化，重扫
     album_dirs = find_leaf_mp3_dirs(dist_root)
+    res_ncm_index = build_ncm_title_index(res_root)
 
     # Step 3/4: 每目录统一封面（APIC）+ 生成 MP4
     for d in album_dirs:
-        cover_file = prepare_cover_for_dir(d, ffmpeg, ffprobe, dry_run)
+        cover_file = prepare_cover_for_dir(
+            d,
+            ffmpeg,
+            ffprobe,
+            dry_run,
+            res_ncm_index=res_ncm_index,
+        )
         if not cover_file:
             continue
 
