@@ -24,23 +24,26 @@ python -m pip install mutagen requests
 
 ### 运行主管道
 ```bash
-# 运行完整的音乐处理管道
-python mp3_pipeline.py --root .
+# Step1: 转换/整理/封面
+python mp3_pipeline_step1.py --root .
 
 # 试运行（预览更改而不执行）
-python mp3_pipeline.py --dry-run
+python mp3_pipeline_step1.py --dry-run
 
 # 跳过NCM转换步骤
-python mp3_pipeline.py --skip-ncm
-
-# 强制CPU编码（禁用GPU）
-python mp3_pipeline.py --no-gpu
-
-# 覆盖现有MP4文件
-python mp3_pipeline.py --overwrite
+python mp3_pipeline_step1.py --skip-ncm
 
 # 强制重命名冲突时添加后缀
-python mp3_pipeline.py --force-rename
+python mp3_pipeline_step1.py --force-rename
+
+# Step2: 生成 MP4（可选）
+python mp3_pipeline_step2.py --root .
+
+# 强制CPU编码（禁用GPU）
+python mp3_pipeline_step2.py --no-gpu
+
+# 覆盖现有MP4文件
+python mp3_pipeline_step2.py --overwrite
 ```
 
 ### 运行单个组件
@@ -168,7 +171,9 @@ print(f"[WARN] 操作失败: {error}", file=sys.stderr)
 
 ```
 Music/
-├── mp3_pipeline.py          # 主处理脚本
+├── pipeline_core.py         # 公共处理逻辑
+├── mp3_pipeline_step1.py    # Step1: 转换/整理/封面
+├── mp3_pipeline_step2.py    # Step2: 生成 MP4
 ├── netease_cover.py         # 网易云音乐API集成
 ├── tools/um.exe            # Unlock Music CLI
 ├── res/                    # 音乐文件的输入目录

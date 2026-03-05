@@ -50,7 +50,9 @@ python -m pip install mutagen requests
 
 ```
 DownloadMusic/
-├── mp3_pipeline.py          # 主处理脚本
+├── pipeline_core.py         # 公共处理逻辑
+├── mp3_pipeline_step1.py    # Step1: 转换/整理/封面
+├── mp3_pipeline_step2.py    # Step2: 用现有封面生成MP4
 ├── netease_cover.py         # 网易云音乐 API 集成
 ├── tools/um.exe            # Unlock Music CLI
 ├── res/                    # 音乐文件输入目录（请在此处放置文件）
@@ -63,44 +65,45 @@ DownloadMusic/
 ### 运行主管道
 
 ```bash
-# 运行完整的音乐处理管道（推荐首次运行前先试运行）
-python mp3_pipeline.py --dry-run
+# Step1 试运行（推荐首次运行先预览）
+python mp3_pipeline_step1.py --dry-run
 
-# 正式运行
-python mp3_pipeline.py --root .
+# Step1 正式运行（转换+重命名+封面）
+python mp3_pipeline_step1.py --root .
 
-# 指定其他根目录
-python mp3_pipeline.py --root /path/to/project
+# Step2 生成 MP4（使用 Step1 产物）
+python mp3_pipeline_step2.py --root .
 ```
 
 ### 命令行参数
 
-| 参数 | 说明 |
-|------|------|
-| `--root PATH` | 项目根目录（默认当前目录，需包含 `res/` 子目录） |
-| `--dry-run` | 试运行模式：预览所有操作但不实际执行 |
-| `--skip-ncm` | 跳过 NCM → MP3 转换步骤 |
-| `--no-gpu` | 禁用 GPU 编码，改用 CPU（libx264） |
-| `--overwrite` | 覆盖已存在的 MP4 文件 |
-| `--force-rename` | 重命名冲突时自动添加后缀（避免跳过） |
+| 参数 | 说明 | 适用脚本 |
+|------|------|----------|
+| `--root PATH` | 项目根目录（默认当前目录） | `step1` / `step2` |
+| `--dry-run` | 试运行模式：预览所有操作但不实际执行 | `step1` / `step2` |
+| `--skip-ncm` | 跳过 NCM → MP3 转换步骤 | `step1` |
+| `--force-rename` | 重命名冲突时自动添加后缀（避免跳过） | `step1` |
+| `--no-online-cover` | 不在线拉取封面（仅用已有封面/APIC） | `step1` |
+| `--no-gpu` | 禁用 GPU 编码，改用 CPU（libx264） | `step2` |
+| `--overwrite` | 覆盖已存在的 MP4 文件 | `step2` |
 
 ### 示例命令
 
 ```bash
 # 快速预览处理效果
-python mp3_pipeline.py --dry-run
+python mp3_pipeline_step1.py --dry-run
 
 # 仅处理已转换的 MP3，跳过 NCM 转换
-python mp3_pipeline.py --skip-ncm
+python mp3_pipeline_step1.py --skip-ncm
 
 # 使用 CPU 编码（适合无 GPU 环境）
-python mp3_pipeline.py --no-gpu
+python mp3_pipeline_step2.py --no-gpu
 
 # 强制覆盖所有 MP4 文件重新生成
-python mp3_pipeline.py --overwrite
+python mp3_pipeline_step2.py --overwrite
 
 # 避免重命名冲突时跳过文件
-python mp3_pipeline.py --force-rename
+python mp3_pipeline_step1.py --force-rename
 ```
 
 ### 测试网易云音乐封面获取

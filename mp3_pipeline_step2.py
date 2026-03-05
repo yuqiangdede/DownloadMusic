@@ -5,7 +5,7 @@ import argparse
 import sys
 from pathlib import Path
 
-import mp3_pipeline as m
+import pipeline_core as m
 
 
 def main() -> None:
