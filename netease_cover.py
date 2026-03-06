@@ -76,11 +76,43 @@ def _download_caa_image(release_id: str, out_jpg: Path, verbose: bool) -> bool:
         return False
 
 
-def _search_mb_release_id(query: str, verbose: bool) -> Optional[str]:
+def _norm_artist_text(text: str) -> str:
+    t = (text or "").casefold()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", t)
+
+
+def _release_artist_matches(release: dict, artist: str) -> bool:
+    expected = _norm_artist_text(artist)
+    if not expected:
+        return True
+    credits = release.get("artist-credit", []) or []
+    names = []
+    for item in credits:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name and isinstance(item.get("artist"), dict):
+            name = (item.get("artist", {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    for name in names:
+        got = _norm_artist_text(name)
+        if not got:
+            continue
+        if got == expected or got in expected or expected in got:
+            return True
+    return False
+
+
+def _search_mb_release_id(
+    query: str,
+    verbose: bool,
+    expected_artist: Optional[str] = None,
+) -> Optional[str]:
     try:
         r = requests.get(
             MB_SEARCH_API,
-            params={"query": query, "fmt": "json", "limit": 1},
+            params={"query": query, "fmt": "json", "limit": 5},
             headers=MB_HEADERS,
             timeout=15,
         )
@@ -93,6 +125,17 @@ def _search_mb_release_id(query: str, verbose: bool) -> Optional[str]:
         if not releases:
             if verbose:
                 print(f"[COVER] MB 无结果: {query}")
+            return None
+        if expected_artist:
+            for rel in releases:
+                if not isinstance(rel, dict):
+                    continue
+                if _release_artist_matches(rel, expected_artist):
+                    return rel.get("id")
+            if verbose:
+                print(
+                    f"[COVER] MB 命中但艺人不匹配，已拒绝回退：{query} artist={expected_artist}"
+                )
             return None
         return releases[0].get("id")
     except Exception:
@@ -110,9 +153,12 @@ def _try_fetch_cover_musicbrainz(
         q = f'release:"{album}" AND artist:"{artist}"'
         if verbose:
             print(f"[COVER] MB 查询: {q}")
-        release_id = _search_mb_release_id(q, verbose)
+        release_id = _search_mb_release_id(q, verbose, expected_artist=artist)
         if release_id and _download_caa_image(release_id, out_jpg, verbose):
             return True
+        if verbose:
+            print(f"[COVER] 严格模式：艺人查询失败后不做专辑名回退：{artist} - {album}")
+        return False
     q = f'release:"{album}"'
     if verbose:
         print(f"[COVER] MB 回退查询: {q}")
@@ -173,11 +219,9 @@ def fetch_album_cover(artist: str, album: str, out_jpg: Path, verbose: bool = Fa
         return True
 
     if artist:
-        q = f"{artist} {album}"
         if verbose:
-            print(f"[COVER] 豆瓣查询: {q}")
-        if _try_fetch_cover_douban(q, out_jpg, verbose):
-            return True
+            print(f"[COVER] 严格模式：禁用无艺人回退抓图，放弃：{artist} - {album}")
+        return False
 
     # 回退：只用专辑名
     if verbose:

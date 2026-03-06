@@ -97,6 +97,7 @@ def main() -> None:
     album_dirs = m.find_leaf_mp3_dirs(dist_root)
     res_ncm_index = m.build_ncm_title_index(res_root)
     covers_dir = dist_root / "_covers"
+    missing_cover_albums: list[str] = []
     for d in album_dirs:
         _ = m.prepare_cover_for_dir(
             d,
@@ -107,11 +108,24 @@ def main() -> None:
             allow_online_fetch=not args.no_online_cover,
         )
         cover_file = m.pick_cover_file(d)
-        if cover_file and cover_file.exists():
+        if cover_file and cover_file.exists() and m.is_image_decodable(ffmpeg, cover_file):
             m.ensure_dir(covers_dir, args.dry_run)
             album_name = m.sanitize_windows_name(d.name)
             dst = covers_dir / f"{album_name}{cover_file.suffix.lower()}"
             m.copy_if_missing(cover_file, dst, args.dry_run)
+        else:
+            missing_cover_albums.append(d.name)
+            print(f"[WARN] 专辑缺失可用封面：{d.name}", file=sys.stderr)
+
+    if missing_cover_albums:
+        print(
+            f"[WARN] 以下专辑缺失封面（共 {len(missing_cover_albums)} 张）：",
+            file=sys.stderr,
+        )
+        for name in missing_cover_albums:
+            print(f"[WARN] - {name}", file=sys.stderr)
+    else:
+        print("[COVER] 所有专辑均已生成可用封面。")
 
     print("[DONE] Step1")
 
