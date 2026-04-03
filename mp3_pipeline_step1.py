@@ -72,24 +72,28 @@ def main() -> None:
 
     # Step 2: 重命名 mp3 + LRC 归位
     m.dedupe_mp3_when_track_exists(dist_root, args.dry_run)
+    mp3_by_dir: dict[Path, list[Path]] = {}
     for mp3 in dist_root.rglob("*.mp3"):
-        if not mp3.is_file():
-            continue
-        tags = m.read_id3_basic(mp3)
-        track = m.parse_track(tags.get("track", ""))
-        if not track:
-            print(f"[SKIP] 无 track，跳过：{mp3}")
-            continue
-        if mp3.stem.startswith(f"{track} - "):
-            continue
-        title_part = m.strip_prefix_before_last_dash_space(mp3.stem)
-        new_stem = m.sanitize_windows_name(f"{track} - {title_part}")
-        new_path = mp3.with_name(new_stem + mp3.suffix)
-        m.safe_rename(mp3, new_path, args.dry_run, args.force_rename)
-        lrc_path = mp3.with_suffix(".lrc")
-        if lrc_path.exists():
-            lrc_new = new_path.with_suffix(".lrc")
-            m.safe_rename(lrc_path, lrc_new, args.dry_run, args.force_rename)
+        if mp3.is_file():
+            mp3_by_dir.setdefault(mp3.parent, []).append(mp3)
+
+    for _dir, mp3_list in sorted(mp3_by_dir.items(), key=lambda x: str(x[0]).lower()):
+        track_plan = m.build_track_plan_for_dir(mp3_list)
+        for mp3 in sorted(mp3_list, key=lambda p: str(p.name).lower()):
+            track = track_plan.get(mp3)
+            if not track:
+                print(f"[SKIP] 无可用 track，跳过：{mp3}")
+                continue
+            if mp3.stem.startswith(f"{track} - "):
+                continue
+            title_part = m.strip_prefix_before_last_dash_space(mp3.stem)
+            new_stem = m.sanitize_windows_name(f"{track} - {title_part}")
+            new_path = mp3.with_name(new_stem + mp3.suffix)
+            m.safe_rename(mp3, new_path, args.dry_run, args.force_rename)
+            lrc_path = mp3.with_suffix(".lrc")
+            if lrc_path.exists():
+                lrc_new = new_path.with_suffix(".lrc")
+                m.safe_rename(lrc_path, lrc_new, args.dry_run, args.force_rename)
 
     m.align_lrc_with_mp3(dist_root, args.dry_run)
 

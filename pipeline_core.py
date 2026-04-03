@@ -70,6 +70,7 @@ def write_apic(mp3_path: Path, cover_jpg: Path) -> bool:
 
 WIN_INVALID = r'<>:"/\|?*'
 WIN_INVALID_RE = re.compile(rf"[{re.escape(WIN_INVALID)}]")
+COVER_FILE_NAMES = ("Cover.jpg", "Cover.png", "Cover.webp")
 
 
 def windows_input_path(path: Path) -> str:
@@ -163,7 +164,7 @@ def sync_cover_from_res_to_dist(res_root: Path, dist_root: Path, dry_run: bool) 
     for src in res_root.rglob("*"):
         if not src.is_file():
             continue
-        if src.name not in ("Cover.jpg", "Cover.png"):
+        if src.name not in COVER_FILE_NAMES:
             continue
         dst = map_to_dist(res_root, dist_root, src)
         copy_if_missing(src, dst, dry_run)
@@ -212,8 +213,27 @@ def extract_ncm_cover_bytes(ncm_path: Path) -> Optional[bytes]:
 def detect_image_mime_from_bytes(data: bytes) -> str:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
+    return "image/jpeg"
+
+
+def cover_filename_for_mime(mime: str) -> str:
+    if mime == "image/png":
+        return "Cover.png"
+    if mime == "image/webp":
+        return "Cover.webp"
+    return "Cover.jpg"
+
+
+def mime_from_cover_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
     return "image/jpeg"
 
 
@@ -245,6 +265,15 @@ def extract_valid_image_bytes(data: bytes) -> Optional[Tuple[bytes, str]]:
         eoi = data.find(b"\xff\xd9", pos_jpeg + 2)
         if eoi >= 0:
             return data[pos_jpeg : eoi + 2], "image/jpeg"
+
+    pos_riff = data.find(b"RIFF")
+    if pos_riff >= 0 and pos_riff + 12 <= len(data):
+        if data[pos_riff + 8 : pos_riff + 12] == b"WEBP":
+            riff_size = struct.unpack("<I", data[pos_riff + 4 : pos_riff + 8])[0]
+            end = pos_riff + riff_size + 8
+            if end <= len(data):
+                return data[pos_riff:end], "image/webp"
+            return data[pos_riff:], "image/webp"
 
     return None
 
@@ -278,7 +307,7 @@ def try_write_ncm_cover(
     if not cover_data:
         return
     mime = detect_image_mime_from_bytes(cover_data)
-    cover_name = "Cover.png" if mime == "image/png" else "Cover.jpg"
+    cover_name = cover_filename_for_mime(mime)
     cover_path = output_dir / cover_name
     if not cover_path.exists():
         try:
@@ -460,6 +489,11 @@ def safe_rename(
                     return True
             print(f"[SKIP] 目标已存在，跳过重命名：{dst}")
             return False
+        # 仅同目录重命名冲突才自动加后缀；跨目录冲突不改名，避免无关专辑出现 __1
+        same_parent = src.parent.resolve() == dst.parent.resolve()
+        if not same_parent:
+            print(f"[SKIP] 跨目录重名冲突，保留原文件不加后缀：{src} -> {dst}")
+            return False
         base = dst
         i = 1
         while dst.exists():
@@ -480,6 +514,42 @@ def parse_track(track_raw: str) -> Optional[str]:
         t = t.split("/", 1)[0].strip()
     t = re.sub(r"\s+", "", t)
     return t if t else None
+
+
+def build_track_plan_for_dir(mp3_files: List[Path]) -> Dict[Path, str]:
+    """
+    为同一目录下的 mp3 规划 track：
+    - 优先使用 ID3 TRCK
+    - 缺失 TRCK 的文件按文件名排序后补齐未占用数字
+    """
+    plan: Dict[Path, str] = {}
+    used_numeric_tracks: set[int] = set()
+
+    for mp3 in mp3_files:
+        tags = read_id3_basic(mp3)
+        track = parse_track(tags.get("track", ""))
+        if not track:
+            continue
+        plan[mp3] = track
+        if track.isdigit():
+            try:
+                n = int(track)
+            except Exception:
+                n = 0
+            if n > 0:
+                used_numeric_tracks.add(n)
+
+    next_track = 1
+    for mp3 in sorted(mp3_files, key=lambda p: str(p.name).lower()):
+        if mp3 in plan:
+            continue
+        while next_track in used_numeric_tracks:
+            next_track += 1
+        plan[mp3] = str(next_track)
+        used_numeric_tracks.add(next_track)
+        next_track += 1
+
+    return plan
 
 
 def strip_prefix_before_last_dash_space(stem: str) -> str:
@@ -585,7 +655,7 @@ def extract_apic_to_jpg(mp3_path: Path, out_jpg: Path) -> bool:
 
 
 def pick_cover_file(dir_path: Path) -> Optional[Path]:
-    for name in ("Cover.jpg", "Cover.png"):
+    for name in COVER_FILE_NAMES:
         p = dir_path / name
         if p.exists():
             return p
@@ -601,7 +671,7 @@ def sanitize_cover_file(cover_path: Path) -> Path:
     if not parsed:
         return cover_path
     clean, mime = parsed
-    target = cover_path.with_name("Cover.png" if mime == "image/png" else "Cover.jpg")
+    target = cover_path.with_name(cover_filename_for_mime(mime))
     if clean == raw and target == cover_path:
         return cover_path
     try:
@@ -619,9 +689,11 @@ def sanitize_cover_file(cover_path: Path) -> Path:
 def detect_image_format(img_path: Path) -> Optional[str]:
     try:
         with img_path.open("rb") as f:
-            header = f.read(8)
+            header = f.read(12)
         if header.startswith(b"\x89PNG\r\n\x1a\n"):
             return "png"
+        if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+            return "webp"
         if header[:3] == b"\xff\xd8\xff":
             return "jpg"
     except Exception:
@@ -662,6 +734,16 @@ def normalize_cover_extension(cover_path: Path, ffprobe: Optional[str] = None) -
         try:
             cover_path.replace(target)
             print(f"[COVER] 检测到 PNG 封面，重命名为 {target.name}")
+            return target
+        except Exception:
+            return cover_path
+    if fmt == "webp" and cover_path.suffix.lower() != ".webp":
+        target = cover_path.with_name("Cover.webp")
+        if target.exists():
+            return target
+        try:
+            cover_path.replace(target)
+            print(f"[COVER] 检测到 WEBP 封面，重命名为 {target.name}")
             return target
         except Exception:
             return cover_path
@@ -820,11 +902,7 @@ def try_extract_cover_from_res_ncm(
             cover_data, mime = parsed
         else:
             mime = detect_image_mime_from_bytes(cover_data)
-        target = (
-            target_cover.with_name("Cover.png")
-            if mime == "image/png"
-            else target_cover.with_name("Cover.jpg")
-        )
+        target = target_cover.with_name(cover_filename_for_mime(mime))
         try:
             target.write_bytes(cover_data)
         except Exception as e:
@@ -891,7 +969,7 @@ def prepare_cover_for_dir(
                 pass
             return None
         print(f"[COVER] 在线封面拉取成功：{artist} - {album}")
-        mime = "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
+        mime = mime_from_cover_path(target)
         try:
             cover_data = target.read_bytes()
         except Exception:
@@ -972,15 +1050,16 @@ def prepare_cover_for_dir(
         cover_file = normalize_cover_extension(cover_file, ffprobe)
         if cover_file.exists() and not is_image_decodable(ffmpeg, cover_file):
             alt_cover = None
-            if cover_file.name.lower() == "cover.jpg":
-                alt_cover = d / "Cover.png"
-            elif cover_file.name.lower() == "cover.png":
-                alt_cover = d / "Cover.jpg"
+            for name in COVER_FILE_NAMES:
+                candidate = d / name
+                if candidate == cover_file:
+                    continue
+                if candidate.exists() and is_image_decodable(ffmpeg, candidate):
+                    alt_cover = candidate
+                    break
 
             if (
                 alt_cover
-                and alt_cover.exists()
-                and is_image_decodable(ffmpeg, alt_cover)
             ):
                 print(f"[COVER] 当前封面损坏，改用备用：{alt_cover.name}")
                 cover_file = alt_cover
@@ -1020,7 +1099,7 @@ def prepare_cover_for_dir(
             return None
 
     if cover_file.exists():
-        mime = "image/png" if cover_file.suffix.lower() == ".png" else "image/jpeg"
+        mime = mime_from_cover_path(cover_file)
         try:
             cover_data = cover_file.read_bytes()
         except Exception:
@@ -1093,7 +1172,7 @@ def organize_mp3_by_artist_album(
             if src_dir in moved_cover_from:
                 continue
             moved_cover_from.add(src_dir)
-            for cover_name in ("Cover.jpg", "Cover.png"):
+            for cover_name in COVER_FILE_NAMES:
                 cover_src = src_dir / cover_name
                 if not cover_src.exists():
                     continue
@@ -1628,7 +1707,7 @@ def align_lrc_with_mp3(dist_root: Path, dry_run: bool) -> None:
 
 def clean_dist_outputs(dist_root: Path, album_dirs: List[Path], dry_run: bool) -> None:
     keep_dirs = {d.resolve() for d in album_dirs}
-    keep_names = {"Cover.jpg", "Cover.png"}
+    keep_names = set(COVER_FILE_NAMES)
     keep_exts = {".mp3", ".mp4"}
 
     for child in dist_root.iterdir():
@@ -1828,24 +1907,28 @@ def main():
     # Step 2: 重命名 mp3
     # 断点续跑去重：如果已存在 '{track} - {title}.mp3'，删除同内容的 'artist - title.mp3'
     dedupe_mp3_when_track_exists(dist_root, dry_run)
+    mp3_by_dir: Dict[Path, List[Path]] = {}
     for mp3 in dist_root.rglob("*.mp3"):
-        if not mp3.is_file():
-            continue
-        tags = read_id3_basic(mp3)
-        track = parse_track(tags.get("track", ""))
-        if not track:
-            print(f"[SKIP] 无 track，跳过：{mp3}")
-            continue
-        if mp3.stem.startswith(f"{track} - "):
-            continue
-        title_part = strip_prefix_before_last_dash_space(mp3.stem)
-        new_stem = sanitize_windows_name(f"{track} - {title_part}")
-        new_path = mp3.with_name(new_stem + mp3.suffix)
-        safe_rename(mp3, new_path, dry_run, args.force_rename)
-        lrc_path = mp3.with_suffix(".lrc")
-        if lrc_path.exists():
-            lrc_new = new_path.with_suffix(".lrc")
-            safe_rename(lrc_path, lrc_new, dry_run, args.force_rename)
+        if mp3.is_file():
+            mp3_by_dir.setdefault(mp3.parent, []).append(mp3)
+
+    for _dir, mp3_list in sorted(mp3_by_dir.items(), key=lambda x: str(x[0]).lower()):
+        track_plan = build_track_plan_for_dir(mp3_list)
+        for mp3 in sorted(mp3_list, key=lambda p: str(p.name).lower()):
+            track = track_plan.get(mp3)
+            if not track:
+                print(f"[SKIP] 无可用 track，跳过：{mp3}")
+                continue
+            if mp3.stem.startswith(f"{track} - "):
+                continue
+            title_part = strip_prefix_before_last_dash_space(mp3.stem)
+            new_stem = sanitize_windows_name(f"{track} - {title_part}")
+            new_path = mp3.with_name(new_stem + mp3.suffix)
+            safe_rename(mp3, new_path, dry_run, args.force_rename)
+            lrc_path = mp3.with_suffix(".lrc")
+            if lrc_path.exists():
+                lrc_new = new_path.with_suffix(".lrc")
+                safe_rename(lrc_path, lrc_new, dry_run, args.force_rename)
 
     # LRC 归位并与 mp3 同名
     align_lrc_with_mp3(dist_root, dry_run)
