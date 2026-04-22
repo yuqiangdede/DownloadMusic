@@ -36,6 +36,11 @@ except Exception:
     APIC = None
     ID3 = None
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
 
 def write_apic(mp3_path: Path, cover_jpg: Path) -> bool:
     if ID3 is None or APIC is None:
@@ -649,7 +654,11 @@ def extract_apic_to_jpg(mp3_path: Path, out_jpg: Path) -> bool:
         if parsed:
             data, _mime = parsed
         out_jpg.write_bytes(data)
-        return out_jpg.exists() and out_jpg.stat().st_size > 0
+        if not out_jpg.exists() or out_jpg.stat().st_size == 0:
+            return False
+        if Image is not None:
+            return is_image_decodable("", out_jpg)
+        return is_image_decodable("ffmpeg", out_jpg)
     except Exception:
         return False
 
@@ -667,8 +676,20 @@ def sanitize_cover_file(cover_path: Path) -> Path:
         raw = cover_path.read_bytes()
     except Exception:
         return cover_path
+    if not is_image_decodable("ffmpeg", cover_path):
+        try:
+            cover_path.unlink()
+            print(f"[WARN] 删除无效封面文件：{cover_path} ({len(raw)} bytes)")
+        except Exception:
+            pass
+        return cover_path
     parsed = extract_valid_image_bytes(raw)
     if not parsed:
+        try:
+            cover_path.unlink()
+            print(f"[WARN] 删除无效封面文件：{cover_path} ({len(raw)} bytes)")
+        except Exception:
+            pass
         return cover_path
     clean, mime = parsed
     target = cover_path.with_name(cover_filename_for_mime(mime))
@@ -721,6 +742,41 @@ def probe_image_format(ffprobe: str, img_path: Path) -> Optional[str]:
     return fmt if fmt else None
 
 
+def probe_image_dimensions(ffprobe: str, img_path: Path) -> Optional[Tuple[int, int]]:
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0:s=x",
+        windows_input_path(img_path),
+    ]
+    rc, outb, _errb = run_cmd_bytes(cmd, timeout_sec=10)
+    if rc != 0 or not outb:
+        return None
+    text = outb.decode("utf-8", errors="replace").strip().lower()
+    m = re.match(r"^(\d+)x(\d+)$", text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def get_image_dimensions(img_path: Path, ffprobe: Optional[str] = None) -> Optional[Tuple[int, int]]:
+    if Image is not None:
+        try:
+            with Image.open(img_path) as im:
+                return im.size
+        except Exception:
+            pass
+    if ffprobe:
+        return probe_image_dimensions(ffprobe, img_path)
+    return None
+
+
 def normalize_cover_extension(cover_path: Path, ffprobe: Optional[str] = None) -> Path:
     fmt = detect_image_format(cover_path)
     if not fmt and ffprobe:
@@ -763,6 +819,13 @@ def normalize_cover_extension(cover_path: Path, ffprobe: Optional[str] = None) -
 def is_image_decodable(ffmpeg: str, img_path: Path) -> bool:
     if not img_path.exists() or img_path.stat().st_size == 0:
         return False
+    if Image is not None:
+        try:
+            with Image.open(img_path) as im:
+                im.verify()
+            return True
+        except Exception:
+            return False
     cmd = [
         ffmpeg,
         "-v",
@@ -1197,7 +1260,7 @@ def gen_mp4_with_cover_jpg(
     ffmpeg_timeout_sec = 300
     ffmpeg_timeout_retries = 1
     ffmpeg_cpu_retries = 1
-    cover_resize_trigger_bytes = 2 * 1024 * 1024
+    cover_resize_trigger_edge = 720
 
     scale_filter = "scale=720:-1"
     subtitle_filter = ""
@@ -1233,17 +1296,19 @@ def gen_mp4_with_cover_jpg(
     # 输出文件（与命令行保持一致）
     out_file = out_mp4
 
-    def _prepare_cover_for_encode() -> None:
+    def _prepare_cover_for_encode_by_dimensions() -> None:
         nonlocal cover_for_encode, temp_cover_path
-        try:
-            cover_size = cover_jpg.stat().st_size
-        except Exception:
+        dims = get_image_dimensions(cover_jpg, ffprobe)
+        if not dims:
             return
-        if cover_size <= cover_resize_trigger_bytes:
+        width, height = dims
+        cover_max_edge = max(width, height)
+        if cover_max_edge <= cover_resize_trigger_edge:
             return
 
         print(
-            f"[COVER] 封面文件较大，编码前缩放为 600x600：{cover_jpg.name} ({cover_size} bytes)"
+            f"[COVER] 封面长边超过 {cover_resize_trigger_edge}px，编码前缩放："
+            f"{cover_jpg.name} ({width}x{height})"
         )
         if dry_run:
             return
@@ -1251,23 +1316,26 @@ def gen_mp4_with_cover_jpg(
         try:
             temp_dir = Path(tempfile.gettempdir()) / "downloadmusic_cover_tmp"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            key_src = f"{cover_jpg.resolve()}|{cover_size}|{cover_jpg.stat().st_mtime_ns}"
+            try:
+                cover_mtime_ns = cover_jpg.stat().st_mtime_ns
+            except Exception:
+                cover_mtime_ns = 0
+            key_src = f"{cover_jpg.resolve()}|{width}x{height}|{cover_mtime_ns}"
             key = hashlib.sha1(key_src.encode("utf-8", errors="replace")).hexdigest()[:12]
-            target = temp_dir / f"{key}_600.jpg"
+            target = temp_dir / f"{key}_{cover_resize_trigger_edge}.jpg"
             if target.exists() and target.stat().st_size > 0 and is_image_decodable(ffmpeg, target):
                 cover_for_encode = target
                 temp_cover_path = target
-                print(
-                    f"[COVER] 复用 600x600 临时封面：{target.name} ({target.stat().st_size} bytes)"
-                )
+                print(f"[COVER] 复用临时缩图：{target.name} ({target.stat().st_size} bytes)")
                 return
+
             cmd = [
                 ffmpeg,
                 "-y",
                 "-i",
                 windows_input_path(cover_jpg),
                 "-vf",
-                "scale=600:600",
+                f"scale={cover_resize_trigger_edge}:{cover_resize_trigger_edge}:force_original_aspect_ratio=decrease",
                 "-q:v",
                 "2",
                 windows_input_path(target),
@@ -1281,10 +1349,9 @@ def gen_mp4_with_cover_jpg(
             ):
                 cover_for_encode = target
                 temp_cover_path = target
-                print(
-                    f"[COVER] 已使用 600x600 临时封面：{target.name} ({target.stat().st_size} bytes)"
-                )
+                print(f"[COVER] 已生成临时缩图：{target.name} ({target.stat().st_size} bytes)")
                 return
+
             print(
                 f"[WARN] 预缩放封面失败，将使用原图：{cover_jpg}\n"
                 f"{decode_bytes(errb)}\n{decode_bytes(outb)}",
@@ -1367,7 +1434,7 @@ def gen_mp4_with_cover_jpg(
     print(
         f"[MP4] cover={cover_jpg.name} audio={audio_mp3.name} -> {out_mp4.name} (vcodec={vcodec})"
     )
-    _prepare_cover_for_encode()
+    _prepare_cover_for_encode_by_dimensions()
     if dry_run:
         return True
 
