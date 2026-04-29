@@ -29,6 +29,14 @@ DOUBAN_HEADERS = {
     "Referer": "https://music.douban.com/",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+IMAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    ),
+    "Referer": "https://music.163.com/",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
 
 
 def _verify_image_bytes(data: bytes) -> bool:
@@ -70,6 +78,19 @@ def _download(url: Optional[str], out_jpg: Path, headers: dict) -> bool:
         return out_jpg.exists() and out_jpg.stat().st_size > 0
     except Exception:
         return False
+
+
+def fetch_cover_url(url: str, out_jpg: Path, verbose: bool = False) -> bool:
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return False
+    if verbose:
+        print(f"[COVER] direct cover url: {url}")
+    ok = _download(url, out_jpg, IMAGE_HEADERS)
+    if ok and verbose:
+        print(f"[COVER] direct cover url succeeded: {out_jpg}")
+    elif verbose:
+        print(f"[COVER] direct cover url failed: {url}")
+    return ok
 
 
 def _download_caa_image(release_id: str, out_jpg: Path, verbose: bool) -> bool:

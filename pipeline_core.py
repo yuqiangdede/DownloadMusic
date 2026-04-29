@@ -16,6 +16,7 @@
 """
 
 import argparse
+import base64
 import json
 import hashlib
 import os
@@ -27,7 +28,7 @@ import time
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from mutagen.id3 import ID3
@@ -40,6 +41,11 @@ try:
     from PIL import Image
 except Exception:
     Image = None
+
+try:
+    from Crypto.Cipher import AES
+except Exception:
+    AES = None
 
 
 def write_apic(mp3_path: Path, cover_jpg: Path) -> bool:
@@ -76,6 +82,9 @@ def write_apic(mp3_path: Path, cover_jpg: Path) -> bool:
 WIN_INVALID = r'<>:"/\|?*'
 WIN_INVALID_RE = re.compile(rf"[{re.escape(WIN_INVALID)}]")
 COVER_FILE_NAMES = ("Cover.jpg", "Cover.png", "Cover.webp")
+NCM_META_KEY = b"#14ljk_!\\]&0U<'("
+NCM_META_PREFIX = b"163 key(Don't modify):"
+_warned_ncm_crypto_missing = False
 
 
 def windows_input_path(path: Path) -> str:
@@ -181,6 +190,85 @@ def sync_lyrics_from_res_to_dist(res_root: Path, dist_root: Path, dry_run: bool)
             continue
         dst = map_to_dist(res_root, dist_root, src)
         copy_if_missing(src, dst, dry_run)
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data:
+        return data
+    pad_len = data[-1]
+    if pad_len <= 0 or pad_len > 16 or pad_len > len(data):
+        return data
+    if data[-pad_len:] != bytes([pad_len]) * pad_len:
+        return data
+    return data[:-pad_len]
+
+
+def _decrypt_ncm_aes_ecb(data: bytes, key: bytes) -> Optional[bytes]:
+    if AES is None:
+        return None
+    if not data or len(data) % 16 != 0:
+        return None
+    try:
+        cipher = AES.new(key, AES.MODE_ECB)
+        return _pkcs7_unpad(cipher.decrypt(data))
+    except Exception:
+        return None
+
+
+def read_ncm_metadata(ncm_path: Path, verbose: bool = False) -> Dict[str, Any]:
+    global _warned_ncm_crypto_missing
+
+    if AES is None:
+        if not _warned_ncm_crypto_missing:
+            print(
+                "[WARN] 缺少 pycryptodome，无法读取 NCM 元数据封面 URL。"
+                "请在项目 .venv 中安装：python -m pip install pycryptodome",
+                file=sys.stderr,
+            )
+            _warned_ncm_crypto_missing = True
+        return {}
+
+    try:
+        with ncm_path.open("rb") as f:
+            if f.read(8) != b"CTENFDAM":
+                return {}
+            f.seek(2, 1)
+
+            key_len_raw = f.read(4)
+            if len(key_len_raw) != 4:
+                return {}
+            key_len = struct.unpack("<I", key_len_raw)[0]
+            f.seek(key_len, 1)
+
+            meta_len_raw = f.read(4)
+            if len(meta_len_raw) != 4:
+                return {}
+            meta_len = struct.unpack("<I", meta_len_raw)[0]
+            if meta_len <= 0 or meta_len > 4 * 1024 * 1024:
+                return {}
+
+            encrypted_meta = f.read(meta_len)
+            if len(encrypted_meta) != meta_len:
+                return {}
+
+        xored_meta = bytes(b ^ 0x63 for b in encrypted_meta)
+        if xored_meta.startswith(NCM_META_PREFIX):
+            xored_meta = xored_meta[len(NCM_META_PREFIX) :]
+        else:
+            xored_meta = xored_meta[22:]
+
+        decrypted = _decrypt_ncm_aes_ecb(base64.b64decode(xored_meta), NCM_META_KEY)
+        if not decrypted:
+            return {}
+        if decrypted.startswith(b"music:"):
+            decrypted = decrypted[6:]
+
+        metadata = json.loads(decrypted.decode("utf-8", errors="replace"))
+        return metadata if isinstance(metadata, dict) else {}
+    except Exception as e:
+        if verbose:
+            print(f"[WARN] 读取 NCM 元数据失败：{ncm_path} err={e}", file=sys.stderr)
+        return {}
 
 
 def extract_ncm_cover_bytes(ncm_path: Path) -> Optional[bytes]:
@@ -887,31 +975,114 @@ def title_from_stem_for_match(stem: str) -> str:
     return strip_prefix_before_last_dash_space(stem).strip()
 
 
+def ncm_metadata_artist_names(metadata: Dict[str, Any]) -> List[str]:
+    artists = metadata.get("artist") or metadata.get("artists") or []
+    names: List[str] = []
+    if isinstance(artists, list):
+        for item in artists:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, list) and item:
+                first = item[0]
+                if isinstance(first, str):
+                    names.append(first)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("artistName")
+                if isinstance(name, str):
+                    names.append(name)
+    elif isinstance(artists, str):
+        names.append(artists)
+    return [name.strip() for name in names if name and name.strip()]
+
+
+def ncm_metadata_album_name(metadata: Dict[str, Any]) -> str:
+    album = metadata.get("album") or metadata.get("albumName") or ""
+    if isinstance(album, str):
+        return album.strip()
+    if isinstance(album, dict):
+        for key in ("name", "albumName"):
+            value = album.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def ncm_metadata_title(metadata: Dict[str, Any]) -> str:
+    for key in ("musicName", "songName", "name", "title"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def ncm_metadata_cover_urls(metadata: Dict[str, Any]) -> List[str]:
+    urls: Dict[str, None] = {}
+    for key in ("albumPic", "coverUrl", "picUrl", "albumPicUrl", "cover", "image"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://")):
+            urls[value.strip()] = None
+    album = metadata.get("album")
+    if isinstance(album, dict):
+        for key in ("picUrl", "coverUrl", "albumPic", "image"):
+            value = album.get(key)
+            if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://")):
+                urls[value.strip()] = None
+    return list(urls.keys())
+
+
+def add_ncm_index_key(index: Dict[str, List[Path]], key_text: str, ncm: Path) -> None:
+    key = normalize_match_key(key_text)
+    if key:
+        index.setdefault(key, []).append(ncm)
+
+
 def build_ncm_title_index(res_root: Path) -> Dict[str, List[Path]]:
     index: Dict[str, List[Path]] = {}
     for ncm in res_root.rglob("*.ncm"):
         if not ncm.is_file():
             continue
-        keys = {
-            normalize_match_key(ncm.stem),
-            normalize_match_key(strip_prefix_before_last_dash_space(ncm.stem)),
-        }
-        for key in keys:
-            if not key:
-                continue
-            index.setdefault(key, []).append(ncm)
+        add_ncm_index_key(index, ncm.stem, ncm)
+        add_ncm_index_key(index, strip_prefix_before_last_dash_space(ncm.stem), ncm)
+
+        metadata = read_ncm_metadata(ncm)
+        title = ncm_metadata_title(metadata)
+        album = ncm_metadata_album_name(metadata)
+        artists = ncm_metadata_artist_names(metadata)
+        add_ncm_index_key(index, title, ncm)
+        add_ncm_index_key(index, album, ncm)
+        for artist in artists:
+            add_ncm_index_key(index, f"{artist} - {title}", ncm)
+            add_ncm_index_key(index, f"{artist} - {album}", ncm)
     return index
 
 
 def collect_cover_lookup_keys_for_dir(d: Path) -> List[str]:
     keys: Dict[str, None] = {}
+    for key_text in (d.name, strip_prefix_before_last_dash_space(d.name)):
+        key = normalize_match_key(key_text)
+        if key:
+            keys[key] = None
     for mp3 in sorted(d.rglob("*.mp3"), key=lambda p: str(p).lower()):
         if not mp3.is_file():
             continue
         tags = read_id3_basic(mp3)
+        artist = (tags.get("artist") or "").strip()
+        album = (tags.get("album") or "").strip()
         title = (tags.get("title") or "").strip()
         if title:
             key = normalize_match_key(title)
+            if key:
+                keys[key] = None
+        if album:
+            key = normalize_match_key(album)
+            if key:
+                keys[key] = None
+        if artist and album:
+            key = normalize_match_key(f"{artist} - {album}")
+            if key:
+                keys[key] = None
+        if artist and title:
+            key = normalize_match_key(f"{artist} - {title}")
             if key:
                 keys[key] = None
         stem_title = title_from_stem_for_match(mp3.stem)
@@ -922,16 +1093,11 @@ def collect_cover_lookup_keys_for_dir(d: Path) -> List[str]:
     return list(keys.keys())
 
 
-def try_extract_cover_from_res_ncm(
+def collect_candidate_ncms_for_dir(
     d: Path,
-    target_cover: Path,
     res_ncm_index: Dict[str, List[Path]],
-) -> Optional[Tuple[Path, bytes, str]]:
+) -> Tuple[List[str], List[Path]]:
     lookup_keys = collect_cover_lookup_keys_for_dir(d)
-    if not lookup_keys:
-        print(f"[COVER] 原始 NCM 封面匹配键为空，跳过：{d.name}")
-        return None
-
     candidate_ncms: List[Path] = []
     seen: set[Path] = set()
     for key in lookup_keys:
@@ -944,6 +1110,18 @@ def try_extract_cover_from_res_ncm(
                 continue
             seen.add(resolved)
             candidate_ncms.append(ncm)
+    return lookup_keys, candidate_ncms
+
+
+def try_extract_cover_from_res_ncm(
+    d: Path,
+    target_cover: Path,
+    res_ncm_index: Dict[str, List[Path]],
+) -> Optional[Tuple[Path, bytes, str]]:
+    lookup_keys, candidate_ncms = collect_candidate_ncms_for_dir(d, res_ncm_index)
+    if not lookup_keys:
+        print(f"[COVER] 原始 NCM 封面匹配键为空，跳过：{d.name}")
+        return None
 
     if not candidate_ncms:
         print(f"[COVER] 原始 NCM 未找到候选文件，后续可能在线拉取：{d.name}")
@@ -989,7 +1167,7 @@ def prepare_cover_for_dir(
     res_ncm_index: Optional[Dict[str, List[Path]]] = None,
     allow_online_fetch: bool = True,
 ) -> Optional[Path]:
-    from netease_cover import fetch_album_cover
+    from netease_cover import fetch_album_cover, fetch_cover_url
 
     print(f"[COVER] 准备封面：{d}")
 
@@ -1011,9 +1189,48 @@ def prepare_cover_for_dir(
                 pass
             cover_locked = False
 
+    def _try_fetch_ncm_metadata_cover() -> Optional[Path]:
+        if not allow_online_fetch or not res_ncm_index:
+            return None
+        lookup_keys, candidate_ncms = collect_candidate_ncms_for_dir(d, res_ncm_index)
+        if not lookup_keys or not candidate_ncms:
+            return None
+        print(
+            f"[COVER] 尝试从 NCM 元数据封面 URL 下载：{d.name} "
+            f"(匹配键={len(lookup_keys)} 候选={len(candidate_ncms)})"
+        )
+        target = d / "Cover.jpg"
+        for ncm in candidate_ncms:
+            metadata = read_ncm_metadata(ncm, verbose=True)
+            for url in ncm_metadata_cover_urls(metadata):
+                if not fetch_cover_url(url, target, verbose=True):
+                    continue
+                target = normalize_cover_extension(target, ffprobe)
+                if not is_image_decodable(ffmpeg, target):
+                    try:
+                        target.unlink()
+                    except Exception:
+                        pass
+                    continue
+                print(f"[COVER] 使用 NCM 元数据封面 URL：{ncm.name}")
+                mime = mime_from_cover_path(target)
+                try:
+                    cover_data = target.read_bytes()
+                except Exception:
+                    cover_data = b""
+                if cover_data:
+                    for m in d.rglob("*.mp3"):
+                        write_apic_bytes(m, cover_data, mime)
+                return target
+        print(f"[COVER] NCM 元数据未提供可用封面 URL：{d.name}")
+        return None
+
     def _try_fetch_online_cover() -> Optional[Path]:
         if not allow_online_fetch:
             return None
+        ncm_metadata_cover = _try_fetch_ncm_metadata_cover()
+        if ncm_metadata_cover:
+            return ncm_metadata_cover
         mp3_for_tags = cover_src or pick_first_mp3_recursive(d)
         tags = read_id3_basic(mp3_for_tags) if mp3_for_tags else {}
         artist = tags.get("artist", "")
@@ -1044,7 +1261,7 @@ def prepare_cover_for_dir(
                 write_apic(m, target)
         return target
 
-    if not cover_locked and res_ncm_index:
+    if not cover_locked and not cover_src and res_ncm_index:
         ncm_hit = try_extract_cover_from_res_ncm(d, cover_file, res_ncm_index)
         if ncm_hit and is_image_decodable(ffmpeg, ncm_hit[0]):
             ncm_cover_used = True
@@ -1054,6 +1271,11 @@ def prepare_cover_for_dir(
             cover_src = pick_cover_source_mp3(d) or cover_src
         elif ncm_hit:
             print(f"[WARN] NCM 封面不可解码，忽略并回退：{ncm_hit[0]}")
+            try:
+                ncm_hit[0].unlink()
+            except Exception:
+                pass
+            cover_file = d / "Cover.jpg"
         else:
             print(f"[COVER] 未从原始 NCM 命中封面，继续尝试 APIC/在线：{d.name}")
     elif not res_ncm_index:

@@ -31,16 +31,20 @@
 ## 安装依赖
 
 ```bash
-# 安装 Python 依赖包
-python -m pip install mutagen requests
-
-# （可选）激活虚拟环境
+# 创建并激活项目内虚拟环境
+python -m venv .venv
 .venv\Scripts\activate
+
+# 安装 Python 依赖包
+python -m pip install -r requirements.txt
 ```
 
 **依赖说明**：
 - `mutagen`：用于读取和修改 MP3 的 ID3 标签
 - `requests`：用于网易云音乐 API 的 HTTP 请求
+- `pycryptodome`：用于解密 NCM 元数据，读取原始文件中的封面 URL
+
+虚拟环境固定使用项目根目录下的 `.venv`。模型、工具、封面缓存、离线包等资源如需随项目交付，应放在项目目录内，不依赖项目外路径。
 
 ## 使用方法
 
@@ -138,9 +142,12 @@ python netease_cover.py
 ### Step 3: 封面获取
 为每个目录统一封面：
 1. **优先使用目录内 MP3 的 APIC 标签**：提取第一个包含封面信息的 MP3 的封面
-2. **回退到网易云音乐 API**：如果目录内无封面，根据 artist + album 自动拉取
-3. **封面提取**：将封面写入目录级 `Cover.jpg` 文件（只生成一次）
-4. **封面修复**：自动检测损坏封面并尝试修复，或重新从源提取
+2. **回退到原始 NCM**：先提取 `.ncm` 内嵌图片；如果没有图片，再解密 NCM 元数据并尝试下载其中的封面 URL
+3. **回退到在线封面源**：如果 NCM 未提供可用封面，再根据 artist + album 拉取 MusicBrainz / Cover Art Archive / 豆瓣封面
+4. **封面提取**：将封面写入目录级 `Cover.jpg` / `Cover.png` / `Cover.webp` 文件（只生成一次）
+5. **封面修复**：自动检测损坏封面并尝试修复，或重新从源提取
+
+使用 `--no-online-cover` 时不会访问 NCM 元数据中的远程封面 URL，也不会访问其他在线封面源，只使用已有封面、APIC 和 NCM 内嵌图片。
 
 ### Step 4: MP4 生成
 为每个 MP3 生成同名 MP4 文件：
