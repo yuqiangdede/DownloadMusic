@@ -1,9 +1,9 @@
-!/res/
+/res/
 !/tools/
 !/.venv/
 !/.idea/
 /.idea
 /.omx/
 /__pycache__/
-/dist/_covers/
+/dist/
 *.pyc

@@ -143,7 +143,9 @@ python netease_cover.py
 为每个目录统一封面：
 1. **优先使用目录内 MP3 的 APIC 标签**：提取第一个包含封面信息的 MP3 的封面
 2. **回退到原始 NCM**：先提取 `.ncm` 内嵌图片；如果没有图片，再解密 NCM 元数据并尝试下载其中的封面 URL
-3. **回退到在线封面源**：如果 NCM 未提供可用封面，再根据 artist + album 拉取 MusicBrainz / Cover Art Archive / 豆瓣封面
+3. **回退到在线封面源**：如果 NCM 未提供可用封面，再根据 artist + album 依次尝试 MusicBrainz / Cover Art Archive、Apple Search 和豆瓣
+   - MusicBrainz 会遍历多个匹配发行版，不再只检查第一条结果
+   - Apple Search 和豆瓣结果必须通过艺人、专辑名校验，避免误用歌手照片或其他专辑封面
 4. **封面提取**：将封面写入目录级 `Cover.jpg` / `Cover.png` / `Cover.webp` 文件（只生成一次）
 5. **封面修复**：自动检测损坏封面并尝试修复，或重新从源提取
 

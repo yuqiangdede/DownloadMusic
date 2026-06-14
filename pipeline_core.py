@@ -744,9 +744,9 @@ def extract_apic_to_jpg(mp3_path: Path, out_jpg: Path) -> bool:
         out_jpg.write_bytes(data)
         if not out_jpg.exists() or out_jpg.stat().st_size == 0:
             return False
-        if Image is not None:
-            return is_image_decodable("", out_jpg)
-        return is_image_decodable("ffmpeg", out_jpg)
+        if is_image_decodable("ffmpeg", out_jpg):
+            return True
+        return fix_cover_image("ffmpeg", out_jpg)
     except Exception:
         return False
 
@@ -913,11 +913,15 @@ def is_image_decodable(ffmpeg: str, img_path: Path) -> bool:
                 im.verify()
             return True
         except Exception:
-            return False
+            pass
+    if not ffmpeg:
+        return False
     cmd = [
         ffmpeg,
         "-v",
         "error",
+        "-f",
+        "image2pipe",
         "-i",
         windows_input_path(img_path),
         "-f",
@@ -933,6 +937,8 @@ def fix_cover_image(ffmpeg: str, cover_path: Path) -> bool:
     cmd = [
         ffmpeg,
         "-y",
+        "-f",
+        "image2pipe",
         "-i",
         windows_input_path(cover_path),
         "-q:v",
@@ -1236,6 +1242,10 @@ def prepare_cover_for_dir(
         artist = tags.get("artist", "")
         album = tags.get("album", "")
         if not artist or not album:
+            print(
+                f"[COVER] 元数据不足，跳过在线封面：{d.name} "
+                f"(artist={artist or '<empty>'} album={album or '<empty>'})"
+            )
             return None
         target = d / "Cover.jpg"
         ok = fetch_album_cover(artist, album, target, verbose=True)
