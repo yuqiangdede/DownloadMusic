@@ -6,4 +6,5 @@
 /.omx/
 /__pycache__/
 /dist/
+/cache/
 *.pyc

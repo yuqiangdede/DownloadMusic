@@ -2087,7 +2087,11 @@ def build_um_cmd(um: Path, output_dir: Path, input_path: Path) -> List[str]:
 
 
 def convert_ncm_to_mp3(
-    um: Path, input_path: Path, output_dir: Path, dry_run: bool
+    um: Path,
+    input_path: Path,
+    output_dir: Path,
+    dry_run: bool,
+    write_cover: bool = True,
 ) -> bool:
     cmd = build_um_cmd(um, output_dir, input_path)
     print(f"[NCM->MP3] {input_path} -> {output_dir}  (via {um.name})")
@@ -2111,7 +2115,8 @@ def convert_ncm_to_mp3(
         if "successfully converted" in combined and any(
             m in combined for m in benign_markers
         ):
-            try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
+            if write_cover:
+                try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
             return True
         print(
             f"[WARN] NCM 转换失败：{input_path}\n{err_text}\n{out_text}",
@@ -2119,7 +2124,8 @@ def convert_ncm_to_mp3(
         )
         return False
 
-    try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
+    if write_cover:
+        try_write_ncm_cover(input_path, output_dir, before_files, start_ts)
     return True
 
 

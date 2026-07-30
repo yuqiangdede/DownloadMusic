@@ -77,19 +77,45 @@ python mp3_pipeline_step1.py --root .
 
 # Step2 生成 MP4（使用 Step1 产物）
 python mp3_pipeline_step2.py --root .
+
+# Step3：保留 res 原目录结构，直接生成 dist 中的 MP3/MP4
+python mp3_pipeline_step3.py --root .
 ```
 
 ### 命令行参数
 
 | 参数 | 说明 | 适用脚本 |
 |------|------|----------|
-| `--root PATH` | 项目根目录（默认当前目录） | `step1` / `step2` |
-| `--dry-run` | 试运行模式：预览所有操作但不实际执行 | `step1` / `step2` |
-| `--skip-ncm` | 跳过 NCM → MP3 转换步骤 | `step1` |
+| `--root PATH` | 项目根目录（默认当前目录） | `step1` / `step2` / `step3` |
+| `--dry-run` | 试运行模式：预览所有操作但不实际执行 | `step1` / `step2` / `step3` |
+| `--skip-ncm` | 跳过 NCM → MP3 转换步骤 | `step1` / `step3` |
 | `--force-rename` | 重命名冲突时自动添加后缀（避免跳过） | `step1` |
-| `--no-online-cover` | 不在线拉取封面（仅用已有封面/APIC） | `step1` |
-| `--no-gpu` | 禁用 GPU 编码，改用 CPU（libx264） | `step2` |
-| `--overwrite` | 覆盖已存在的 MP4 文件 | `step2` |
+| `--no-online-cover` | 不在线拉取封面（仅用已有封面/APIC） | `step1` / `step3` |
+| `--no-gpu` | 禁用 GPU 编码，改用 CPU（libx264） | `step2` / `step3` |
+| `--overwrite` | 覆盖已存在的 MP4 文件 | `step2` / `step3` |
+
+### `mp3_pipeline_step3.py`：保留目录结构的独立流程
+
+`mp3_pipeline_step3.py` 不会按歌手/专辑移动或重命名文件，而是把 `res/` 下的相对路径原样映射到 `dist/`：
+
+```bash
+# 先预览，不实际转换或下载
+python mp3_pipeline_step3.py --dry-run
+
+# 正式运行：NCM → MP3、封面、MP4
+python mp3_pipeline_step3.py
+
+# 跳过 NCM，只处理已有 MP3
+python mp3_pipeline_step3.py --skip-ncm
+
+# 使用 CPU 编码
+python mp3_pipeline_step3.py --no-gpu
+
+# 重新生成已有 MP4
+python mp3_pipeline_step3.py --overwrite
+```
+
+脚本会保留原始文件名；NCM 输出为同名 MP3，MP4 也使用同名 stem。封面写入 MP3 的 APIC，并缓存到项目内的 `cache/covers/`，不会在歌曲目录旁额外生成封面文件。匹配的 `.lrc` 会复制到 `dist/` 并继续用于 MP4 字幕。
 
 ### 示例命令
 
